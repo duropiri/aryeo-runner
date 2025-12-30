@@ -28,7 +28,7 @@ RUN npm run build
 # -----------------------------------------------------------------------------
 # Stage 2: Production
 # -----------------------------------------------------------------------------
-FROM mcr.microsoft.com/playwright:v1.48.0-jammy AS production
+FROM mcr.microsoft.com/playwright:v1.57.0-jammy AS production
 
 # Set working directory
 WORKDIR /app
