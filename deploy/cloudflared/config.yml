@@ -1,0 +1,40 @@
+# =============================================================================
+# Cloudflare Tunnel Configuration
+# =============================================================================
+# Location: /etc/cloudflared/config.yml (on the server)
+#
+# Prerequisites:
+#   1. Install cloudflared
+#   2. Run: cloudflared tunnel login
+#   3. Run: cloudflared tunnel create aryeo-runner
+#   4. Copy the tunnel ID and credentials file path below
+#   5. Run: cloudflared tunnel route dns aryeo-runner runner.yourdomain.com
+# =============================================================================
+
+# Tunnel UUID (replace with your tunnel ID from step 3)
+tunnel: YOUR_TUNNEL_UUID_HERE
+
+# Path to credentials file (created during tunnel create)
+credentials-file: /etc/cloudflared/credentials.json
+
+# Ingress rules - routes traffic from Cloudflare to your services
+ingress:
+  # Route runner.yourdomain.com to the local API server
+  - hostname: runner.yourdomain.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      # Timeout for the origin connection
+      connectTimeout: 30s
+      # Keep connections alive
+      keepAliveConnections: 10
+      # Don't verify TLS (localhost doesn't have certs)
+      noTLSVerify: false
+
+  # Catch-all rule (required) - returns 404 for unmatched requests
+  - service: http_status:404
+
+# Logging
+loglevel: info
+
+# Metrics server (optional, for monitoring)
+# metrics: 127.0.0.1:2000

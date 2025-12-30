@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment files (NEVER commit these)
+.env
+.env.local
+.env.*.local
+.env.production
+
+# Cloudflare Tunnel credentials (NEVER commit)
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+credentials.json
+
+# Data directories
+data/auth/
+data/evidence/
+data/temp/
+
+# Keep data directory structure
+!data/.gitkeep
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+
+# Temporary files
+*.tmp
+*.temp

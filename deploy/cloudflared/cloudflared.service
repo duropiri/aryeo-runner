@@ -1,0 +1,39 @@
+# =============================================================================
+# Cloudflare Tunnel - systemd Service Unit
+# =============================================================================
+# Location: /etc/systemd/system/cloudflared.service
+#
+# After creating this file, run:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable cloudflared
+#   sudo systemctl start cloudflared
+#   sudo systemctl status cloudflared
+# =============================================================================
+
+[Unit]
+Description=Cloudflare Tunnel for Aryeo Delivery Runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run
+Restart=always
+RestartSec=5
+TimeoutStartSec=0
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cloudflared
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/cloudflared
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

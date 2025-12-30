@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # Redis for BullMQ job queue
+  redis:
+    image: redis:7-alpine
+    container_name: aryeo-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aryeo-api
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_ENV=production
+      - RUNNER_PORT=8080
+      - RUNNER_AUTH_TOKEN=${RUNNER_AUTH_TOKEN}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-cdn.virtualxposure.com,youriguide.com}
+      - REDIS_URL=redis://redis:6379
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["node", "dist/server.js"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Worker Service
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aryeo-worker
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - RUNNER_AUTH_TOKEN=${RUNNER_AUTH_TOKEN}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS:-cdn.virtualxposure.com,youriguide.com}
+      - REDIS_URL=redis://redis:6379
+      - PLAYWRIGHT_HEADLESS=true
+      - PLAYWRIGHT_TIMEOUT_MS=${PLAYWRIGHT_TIMEOUT_MS:-60000}
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      - ./data:/app/data
+      # For debugging, you can mount the storage state from host
+      # - ./data/auth/aryeo-storage-state.json:/app/data/auth/aryeo-storage-state.json:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command: ["node", "dist/worker.js"]
+    # Give worker more resources for Playwright
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+volumes:
+  redis-data:
