@@ -1,16 +1,6 @@
 # =============================================================================
 # Aryeo Delivery Runner - Production Docker Compose
 # =============================================================================
-# Usage:
-#   docker-compose -f docker-compose.production.yml up -d
-#
-# Prerequisites:
-#   1. Copy .env.production to .env and fill in values
-#   2. Place aryeo-storage-state.json in ./data/auth/
-#   3. Configure Cloudflare Tunnel (see deploy/cloudflared/)
-# =============================================================================
-
-version: '3.8'
 
 services:
   # ===========================================================================
@@ -20,12 +10,10 @@ services:
     image: redis:7-alpine
     container_name: aryeo-redis
     restart: always
-    # Do NOT expose Redis port in production (internal only)
-    # ports:
-    #   - "6379:6379"
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    # IMPORTANT: noeviction so jobs/results don't disappear under memory pressure
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -34,12 +22,6 @@ services:
       start_period: 5s
     networks:
       - runner-internal
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 128M
 
   # ===========================================================================
   # API Server - Handles HTTP requests
@@ -51,7 +33,6 @@ services:
     image: aryeo-delivery-runner:latest
     container_name: aryeo-api
     restart: always
-    # Exposed to host for Cloudflare Tunnel / reverse proxy
     ports:
       - "127.0.0.1:8080:8080"
     env_file:
@@ -63,10 +44,10 @@ services:
       - DATA_DIR=/app/data
       - TRUST_PROXY=true
     volumes:
-      # Persistent data volume for evidence screenshots
-      - runner-data:/app/data
-      # Mount auth state from host (read-only for security)
-      - ./data/auth/aryeo-storage-state.json:/app/data/auth/aryeo-storage-state.json:ro
+      # Single host bind mount for ALL persistent runner data:
+      # - /opt/aryeo-runner/data/auth/aryeo-storage-state.json
+      # - /opt/aryeo-runner/data/evidence/...
+      - /opt/aryeo-runner/data:/app/data
     depends_on:
       redis:
         condition: service_healthy
@@ -79,12 +60,6 @@ services:
       start_period: 10s
     networks:
       - runner-internal
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-        reservations:
-          memory: 256M
     logging:
       driver: "json-file"
       options:
@@ -101,7 +76,6 @@ services:
     image: aryeo-delivery-runner:latest
     container_name: aryeo-worker
     restart: always
-    # No ports exposed - worker is internal only
     env_file:
       - .env
     environment:
@@ -110,17 +84,14 @@ services:
       - PLAYWRIGHT_HEADLESS=true
       - DATA_DIR=/app/data
     volumes:
-      # Persistent data volume for evidence screenshots
-      - runner-data:/app/data
-      # Mount auth state from host (read-only for security)
-      - ./data/auth/aryeo-storage-state.json:/app/data/auth/aryeo-storage-state.json:ro
+      # Same single host bind mount
+      - /opt/aryeo-runner/data:/app/data
     depends_on:
       redis:
         condition: service_healthy
       api:
         condition: service_healthy
     command: ["node", "dist/worker.js"]
-    # Worker doesn't have HTTP healthcheck, use process check
     healthcheck:
       test: ["CMD", "pgrep", "-f", "node dist/worker.js"]
       interval: 30s
@@ -129,39 +100,20 @@ services:
       start_period: 30s
     networks:
       - runner-internal
-    # Worker needs more resources for Playwright/Chromium
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-          cpus: '2'
-        reservations:
-          memory: 1G
-          cpus: '1'
-    # Required for Playwright in Docker
     security_opt:
       - seccomp:unconfined
-    # Share memory for Chromium
-    shm_size: '1gb'
+    shm_size: "1gb"
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "5"
 
-# =============================================================================
-# Networks
-# =============================================================================
 networks:
   runner-internal:
     driver: bridge
-    internal: false  # Allow outbound internet access for callbacks
+    internal: false
 
-# =============================================================================
-# Volumes
-# =============================================================================
 volumes:
   redis-data:
-    driver: local
-  runner-data:
     driver: local
