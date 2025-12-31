@@ -17,6 +17,11 @@ export const ErrorCodes = {
   ARYEO_DELIVER_FAILED: 'ARYEO_DELIVER_FAILED',
   RUN_NOT_FOUND: 'RUN_NOT_FOUND',
   INTERNAL_ERROR: 'INTERNAL_ERROR',
+  // State-driven error codes for deterministic automation
+  UPLOAD_PENDING: 'UPLOAD_PENDING',       // Upload still in progress - not a failure
+  UI_NOT_READY: 'UI_NOT_READY',           // UI not in expected state for action
+  ACTION_FAILED: 'ACTION_FAILED',         // UI was idle, action attempted, but did not succeed
+  VERIFICATION_FAILED: 'VERIFICATION_FAILED', // Post-action verification failed after UI idle
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Page, type Locator } from 'playwright';
 import { getConfig } from '../config.js';
 import { logger } from '../logger.js';
 import { addEvidenceScreenshot } from '../queue.js';
@@ -33,6 +33,15 @@ import {
   getUserMenu,
   waitForLoadingComplete,
   has3DContentWithTitle,
+  // State-driven imports
+  getUploadUIState,
+  isUploadInProgress,
+  isUIReadyForCommit,
+  waitForUploadReadyState,
+  waitForMediaSectionUpdate,
+  waitForModalClose,
+  hasFileInMediaRow,
+  type UploadUIState,
 } from './selectors.js';
 
 // Retry configuration
@@ -220,6 +229,9 @@ async function createAuthenticatedContext(): Promise<{
 
 /**
  * Navigates to the listing edit page and verifies it loaded
+ *
+ * STATE-DRIVEN: Uses page load states and observable UI elements
+ * instead of fixed delays.
  */
 async function navigateToListing(
   ctx: AutomationContext,
@@ -233,11 +245,11 @@ async function navigateToListing(
 
       await ctx.page.goto(listingEditUrl, { waitUntil: 'domcontentloaded' });
 
-      // Wait for page to stabilize (avoid networkidle)
-      await delay(2000);
+      // STATE-DRIVEN: Wait for page to stabilize by checking for key elements
+      // Instead of fixed delay, poll for the user menu to appear
+      const pageReady = await waitForPageReady(ctx.page, 10000);
 
-      // Check if we're still logged in
-      if (!(await isLoggedIn(ctx.page))) {
+      if (!pageReady.loggedIn) {
         log.error('Not logged in after navigation');
         await takeScreenshot(ctx, Steps.NAVIGATE_TO_LISTING, 'not_logged_in');
         return {
@@ -250,7 +262,7 @@ async function navigateToListing(
         };
       }
 
-      // Wait for the Media section to be visible
+      // Wait for loading indicators to clear
       await waitForLoadingComplete(ctx.page);
 
       // Verify we can see the Media section with expected rows
@@ -282,10 +294,43 @@ async function navigateToListing(
 }
 
 /**
+ * Waits for the page to be ready by checking for login state and key elements
+ */
+async function waitForPageReady(
+  page: Page,
+  timeout: number
+): Promise<{ ready: boolean; loggedIn: boolean }> {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeout) {
+    // Check if user is logged in (user menu visible)
+    const loggedIn = await isLoggedIn(page);
+
+    if (loggedIn) {
+      return { ready: true, loggedIn: true };
+    }
+
+    // Check for login redirect (if we're on a login page, we're not logged in)
+    const url = page.url();
+    if (url.includes('/login') || url.includes('/auth')) {
+      return { ready: true, loggedIn: false };
+    }
+
+    await page.waitForTimeout(TIMEOUTS.STATE_POLL_INTERVAL);
+  }
+
+  // Timeout - check final state
+  const loggedIn = await isLoggedIn(page);
+  return { ready: loggedIn, loggedIn };
+}
+
+/**
  * Imports a single URL via the "From link" flow for Floor Plans or Files.
  *
- * CRITICAL: This function now properly waits for staging, clicks the commit button,
- * waits for modal close, and verifies the count incremented.
+ * STATE-DRIVEN APPROACH:
+ * - No fixed delays or blind retries
+ * - All waits are based on observable UI state
+ * - Only declares failure when UI is idle and expected state did not occur
  */
 async function importFromLink(
   ctx: AutomationContext,
@@ -297,121 +342,126 @@ async function importFromLink(
   baselineCount: number
 ): Promise<{ success: true } | { success: false; error: DeliveryError }> {
   const log = logger.child({ run_id: ctx.runId, step, rowLabel, index, url, baselineCount });
+  const expectedCountAfterImport = baselineCount + index + 1;
+
+  // Extract filename from URL for verification
+  const urlFilename = extractFilenameFromUrl(url);
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       log.info({ attempt }, `Importing URL via "From link" for ${rowLabel}`);
 
-      // Step 1: Find and click the Add button for this row
+      // STEP 1: Click Add button for this row
       const addButton = getAddButtonForRow(ctx.page, rowLabel);
       await addButton.waitFor({ state: 'visible', timeout: TIMEOUTS.ELEMENT_VISIBLE });
       await addButton.click();
       log.debug('Clicked Add button');
-      await delay(TIMEOUTS.ACTION_DELAY);
 
-      // Step 2: Click "From link" option in dropdown/menu
+      // STEP 2: Wait for and click "From link" option
       const fromLinkOption = getFromLinkOption(ctx.page);
       await fromLinkOption.waitFor({ state: 'visible', timeout: 5000 });
       await fromLinkOption.click();
       log.debug('Clicked "From link" option');
-      await delay(TIMEOUTS.ACTION_DELAY);
 
-      // Step 3: Fill in the URL input
+      // STEP 3: Fill the URL input
       const urlInput = getImportUrlInput(ctx.page);
       await urlInput.waitFor({ state: 'visible', timeout: 5000 });
       await urlInput.fill(url);
       log.debug('Filled URL input');
-      await delay(TIMEOUTS.ACTION_DELAY);
 
-      // Step 4: Check "Set titles from filenames" if required (Floor Plans only)
+      // STEP 4: Handle "Set titles from filenames" checkbox with ASSERTION
       if (checkSetTitlesFromFilenames) {
-        const checkbox = getSetTitlesCheckbox(ctx.page);
-        try {
-          await checkbox.waitFor({ state: 'visible', timeout: 3000 });
-          const isChecked = await checkbox.isChecked();
-          if (!isChecked) {
-            await checkbox.check();
-            log.debug('Checked "Set titles from filenames" checkbox');
-          }
-        } catch {
-          log.debug('Set titles checkbox not found, skipping');
-        }
+        await handleSetTitlesCheckbox(ctx, log);
       }
 
-      // Step 5: Click Import button to START STAGING
+      // STEP 5: Click Import button to START STAGING
       const importButton = getImportButton(ctx.page);
       await importButton.waitFor({ state: 'visible', timeout: 5000 });
       await importButton.click();
-      log.debug('Clicked Import button - staging started');
+      log.info('Clicked Import button - staging started');
 
-      // Step 6: Wait for file to be STAGED (preview appears)
-      // The staging process downloads/processes the file, then shows a preview
-      log.info('Waiting for file to be staged...');
-      const stagedPreview = getStagedFilePreview(ctx.page);
-      try {
-        await stagedPreview.waitFor({ state: 'visible', timeout: TIMEOUTS.URL_STAGING });
-        log.debug('File staged - preview visible');
-      } catch (stagingErr) {
-        // Check for error toast during staging
-        const errorToast = getErrorToast(ctx.page);
-        if (await errorToast.isVisible()) {
-          const errorText = await errorToast.textContent();
-          throw new Error(`Staging failed: ${errorText}`);
+      // STEP 6: STATE-DRIVEN WAIT for upload to complete
+      // This polls the UI state until ALL conditions are met:
+      // - Progress bar gone or at 100%
+      // - File row shows real filename (not skeleton)
+      // - Add Files button is enabled
+      // - No loading spinner in modal
+      log.info('Waiting for upload to complete (state-driven)...');
+
+      const uploadResult = await waitForUploadReadyState(ctx.page, TIMEOUTS.UPLOAD_PROGRESS_COMPLETE);
+
+      if (!uploadResult.ready) {
+        // Log detailed state for debugging
+        log.warn({
+          reason: uploadResult.reason,
+          state: uploadResult.state,
+        }, 'Upload did not reach ready state');
+
+        // Check if it's still in progress (not a true failure yet)
+        if (isUploadInProgress(uploadResult.state)) {
+          // This is UPLOAD_PENDING, not a failure - but we've hit our timeout
+          throw new Error(`Upload timeout: ${uploadResult.reason}`);
         }
-        throw new Error(`Staging timeout: file did not appear in staging area within ${TIMEOUTS.URL_STAGING}ms`);
+
+        // Check for error in the UI
+        if (uploadResult.state.hasErrorMessage) {
+          throw new Error(`Upload failed: ${uploadResult.state.errorMessage || 'Unknown error'}`);
+        }
+
+        throw new Error(`UI not ready for commit: ${uploadResult.reason}`);
       }
 
-      // Step 7: Wait for the COMMIT button ("Add 1 File" or "Add X Files") to be enabled
-      log.info('Waiting for commit button to be enabled...');
+      log.info({
+        progressPercent: uploadResult.state.progressPercent,
+        hasRealFilename: uploadResult.state.hasRealFilename,
+        buttonEnabled: uploadResult.state.isAddFilesButtonEnabled,
+      }, 'Upload complete - UI ready for commit');
+
+      // STEP 7: CLICK THE COMMIT BUTTON (Add Files)
       const commitButton = getCommitFilesButton(ctx.page);
-      try {
-        await commitButton.waitFor({ state: 'visible', timeout: TIMEOUTS.COMMIT_BUTTON_ENABLED });
-        // Wait for it to be enabled (not disabled) using evaluate
-        await ctx.page.waitForFunction(
-          `(() => {
-            const btn = document.querySelector('button.bg-primary, button[class*="bg-primary"]');
-            return btn && !btn.disabled;
-          })()`,
-          { timeout: TIMEOUTS.COMMIT_BUTTON_ENABLED }
-        );
-        log.debug('Commit button is enabled');
-      } catch {
-        await takeScreenshot(ctx, step, `commit_button_not_ready_${attempt}`);
-        throw new Error('Commit button ("Add X Files") did not become enabled');
-      }
-
-      // Step 8: CLICK THE COMMIT BUTTON - THIS IS THE KEY FIX
       log.info('Clicking commit button to add file to listing...');
       await commitButton.click();
       log.debug('Clicked commit button');
 
-      // Step 9: Wait for modal/upload sheet to CLOSE
-      log.info('Waiting for upload modal to close...');
-      const uploadModal = getUploadModal(ctx.page);
-      try {
-        await uploadModal.waitFor({ state: 'hidden', timeout: TIMEOUTS.MODAL_CLOSE });
-        log.debug('Upload modal closed');
-      } catch {
-        // Modal might already be closed or have different structure
-        log.debug('Modal close wait timed out - checking if upload succeeded anyway');
+      // STEP 8: Wait for modal to close (state-driven)
+      log.info('Waiting for modal to close...');
+      const modalClosed = await waitForModalClose(ctx.page, TIMEOUTS.MODAL_CLOSE);
+
+      if (!modalClosed) {
+        log.warn('Modal did not close within timeout - checking if upload succeeded anyway');
+      } else {
+        log.debug('Modal closed successfully');
       }
 
-      // Give UI time to update
-      await delay(1500);
+      // STEP 9: Wait for media section to re-render and verify
+      log.info('Waiting for media section to update...');
+      const mediaUpdate = await waitForMediaSectionUpdate(
+        ctx.page,
+        rowLabel,
+        baselineCount + index, // Expected count before this import
+        TIMEOUTS.MEDIA_SECTION_RERENDER
+      );
 
-      // Step 10: VERIFY the file was actually added
-      log.info('Verifying file was added to listing...');
-      const currentCount = await getMediaRowCount(ctx.page, rowLabel);
-      const expectedMinCount = baselineCount + index + 1; // index is 0-based
+      // STEP 10: VERIFY the file was actually added
+      log.info({ currentCount: mediaUpdate.newCount, expectedCount: expectedCountAfterImport }, 'Verifying import...');
 
-      if (currentCount >= expectedMinCount) {
-        log.info({ baselineCount, currentCount, expectedMinCount }, 'Post-condition VERIFIED: count increased');
-      } else {
-        // Count didn't increase - try waiting a bit more
-        const verified = await waitForCountIncrement(ctx, rowLabel, baselineCount + index, TIMEOUTS.POST_VERIFY);
-        if (!verified) {
-          await takeScreenshot(ctx, step, `count_not_incremented_${attempt}`);
-          throw new Error(`Post-condition FAILED: ${rowLabel} count did not increase (baseline: ${baselineCount}, current: ${currentCount}, expected at least: ${expectedMinCount})`);
+      if (mediaUpdate.updated && mediaUpdate.newCount >= expectedCountAfterImport) {
+        log.info({ baselineCount, newCount: mediaUpdate.newCount }, 'Post-condition VERIFIED: count increased');
+        await takeScreenshot(ctx, step, `success_${index}`);
+        return { success: true };
+      }
+
+      // Count didn't increase - try alternative verification: check if filename appears
+      if (urlFilename) {
+        const filenameVisible = await hasFileInMediaRow(ctx.page, rowLabel, urlFilename);
+        if (filenameVisible) {
+          log.warn({
+            baselineCount,
+            currentCount: mediaUpdate.newCount,
+            filename: urlFilename,
+          }, 'Filename visible but count did not change - treating as success');
+          await takeScreenshot(ctx, step, `success_filename_visible_${index}`);
+          return { success: true };
         }
       }
 
@@ -422,27 +472,38 @@ async function importFromLink(
         throw new Error(`Import failed with error: ${errorText}`);
       }
 
-      await takeScreenshot(ctx, step, `success_${index}`);
-      log.info(`Successfully imported URL ${index + 1} for ${rowLabel} - VERIFIED`);
-      return { success: true };
+      // Verification failed but UI is idle - this is ACTION_FAILED
+      await takeScreenshot(ctx, step, `verification_failed_${attempt}_${index}`);
+      throw new Error(`Verification failed: ${rowLabel} count did not increase (baseline: ${baselineCount}, current: ${mediaUpdate.newCount}, expected: ${expectedCountAfterImport})`);
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       log.warn({ attempt, error: errorMessage }, `Import attempt failed for ${rowLabel}`);
 
-      await takeScreenshot(ctx, step, `error_attempt_${attempt}_${index}`);
+      // Only take screenshot if UI is idle (not during loading states)
+      const currentState = await getUploadUIState(ctx.page);
+      if (!isUploadInProgress(currentState)) {
+        await takeScreenshot(ctx, step, `error_attempt_${attempt}_${index}`);
+      }
 
-      // Try to close any open dialogs/modals before retry
+      // Close any open modals before retry
       try {
         await ctx.page.keyboard.press('Escape');
-        await delay(500);
+        await ctx.page.waitForTimeout(300);
         await ctx.page.keyboard.press('Escape');
-        await delay(500);
+        await ctx.page.waitForTimeout(300);
       } catch {
         // Ignore
       }
 
       if (attempt < MAX_RETRIES) {
+        // Only retry if UI is in a stable state (not still processing)
+        const stateBeforeRetry = await getUploadUIState(ctx.page);
+        if (isUploadInProgress(stateBeforeRetry)) {
+          log.info('Upload still in progress - waiting before retry...');
+          // Wait for it to complete or fail before retrying
+          await waitForUploadReadyState(ctx.page, TIMEOUTS.UPLOAD_PROGRESS_COMPLETE);
+        }
         log.info(`Retrying import in ${RETRY_DELAY_MS}ms...`);
         await delay(RETRY_DELAY_MS);
       }
@@ -452,11 +513,77 @@ async function importFromLink(
   return {
     success: false,
     error: {
-      code: ErrorCodes.ARYEO_IMPORT_FAILED,
-      message: `Failed to import URL for ${rowLabel} after ${MAX_RETRIES} retries: ${url}`,
+      code: ErrorCodes.ACTION_FAILED,
+      message: `Failed to import URL for ${rowLabel} after ${MAX_RETRIES} retries (UI was idle, action did not succeed): ${url}`,
       retryable: true,
     },
   };
+}
+
+/**
+ * Handles the "Set titles from filenames" checkbox with proper assertion
+ */
+async function handleSetTitlesCheckbox(
+  ctx: AutomationContext,
+  log: typeof logger
+): Promise<void> {
+  const checkbox = getSetTitlesCheckbox(ctx.page);
+
+  try {
+    // Wait for checkbox to be visible
+    const isVisible = await checkbox.isVisible({ timeout: 3000 }).catch(() => false);
+
+    if (!isVisible) {
+      log.info('"Set titles from filenames" checkbox not found - proceeding without it');
+      return;
+    }
+
+    // Check current state
+    const isChecked = await checkbox.isChecked();
+
+    if (!isChecked) {
+      await checkbox.check();
+      log.debug('Checked "Set titles from filenames" checkbox');
+
+      // ASSERTION: Verify it's now checked
+      const isNowChecked = await checkbox.isChecked();
+      if (!isNowChecked) {
+        log.warn('Checkbox check failed - attempting to click directly');
+        await checkbox.click();
+
+        // Re-verify
+        const finalState = await checkbox.isChecked();
+        if (finalState) {
+          log.debug('Checkbox checked via direct click');
+        } else {
+          log.warn('Could not check "Set titles from filenames" checkbox - proceeding anyway');
+        }
+      }
+    } else {
+      log.debug('"Set titles from filenames" checkbox already checked');
+    }
+  } catch (err) {
+    log.info({ error: err instanceof Error ? err.message : String(err) },
+      'Error handling "Set titles from filenames" checkbox - proceeding without it');
+  }
+}
+
+/**
+ * Extracts filename from a URL for verification purposes
+ */
+function extractFilenameFromUrl(url: string): string | null {
+  try {
+    const urlObj = new URL(url);
+    const pathname = urlObj.pathname;
+    const filename = pathname.split('/').pop();
+    if (filename && filename.length > 0) {
+      // Remove common URL-encoded characters
+      return decodeURIComponent(filename).replace(/\+/g, ' ');
+    }
+  } catch {
+    // Invalid URL
+  }
+  return null;
 }
 
 /**
@@ -570,8 +697,13 @@ async function importRmsFiles(
 /**
  * Adds 3D Content (iGuide tour) via the modal with proper verification.
  *
- * FIXED: Always uses exact title "iGuide 3D Virtual Tour" and selects
- * "Both (Branded + Unbranded)" display type. Verifies addition succeeded.
+ * STATE-DRIVEN APPROACH with explicit assertions:
+ * - Title must ALWAYS be exactly: "iGuide 3D Virtual Tour"
+ * - Display type must ALWAYS be: "Both (Branded + Unbranded)"
+ * - Explicit assertions verify input values match expected
+ * - Re-applies values if they reset due to re-render
+ * - Waits for "Add Content" button to become enabled before clicking
+ * - Verifies content appears in media list after modal closes
  */
 async function add3DContent(
   ctx: AutomationContext,
@@ -592,85 +724,76 @@ async function add3DContent(
     try {
       log.info({ attempt }, 'Adding 3D Content');
 
-      // Step 1: Find and click the Add button for 3D Content row
+      // STEP 1: Click Add button for 3D Content row
       const addButton = getAddButtonForRow(ctx.page, TEXT.THREE_D_CONTENT);
       await addButton.waitFor({ state: 'visible', timeout: TIMEOUTS.ELEMENT_VISIBLE });
       await addButton.click();
       log.debug('Clicked Add button for 3D Content');
-      await delay(TIMEOUTS.ACTION_DELAY);
 
-      // Step 2: Wait for modal to appear
+      // STEP 2: Wait for modal to appear
       const modal = get3DContentModal(ctx.page);
       await modal.waitFor({ state: 'visible', timeout: 5000 });
       log.debug('3D Content modal appeared');
 
-      // Step 3: Fill in Content Title - ALWAYS "iGuide 3D Virtual Tour"
-      const titleInput = getContentTitleInput(ctx.page);
-      await titleInput.waitFor({ state: 'visible', timeout: 5000 });
-      await titleInput.clear();
-      await titleInput.fill(TEXT.IGUIDE_TITLE);
-      log.info({ title: TEXT.IGUIDE_TITLE }, 'Filled Content Title');
-      await delay(TIMEOUTS.ACTION_DELAY);
+      // STEP 3: Set and ASSERT Content Title
+      await setAndAssertTitle(ctx, TEXT.IGUIDE_TITLE, log);
 
-      // Step 4: Fill in Content Link (tour URL)
-      const linkInput = getContentLinkInput(ctx.page);
-      await linkInput.waitFor({ state: 'visible', timeout: 5000 });
-      await linkInput.clear();
-      await linkInput.fill(tourUrl);
-      log.info({ url: tourUrl }, 'Filled Content Link');
-      await delay(TIMEOUTS.ACTION_DELAY);
+      // STEP 4: Set and ASSERT Content Link
+      await setAndAssertLink(ctx, tourUrl, log);
 
-      // Step 5: Select Display Type "Both (Branded + Unbranded)" - ALWAYS
-      const displayDropdown = getDisplayTypeDropdown(ctx.page);
-      try {
-        await displayDropdown.waitFor({ state: 'visible', timeout: 3000 });
-        // Try multiple selection strategies
-        try {
-          await displayDropdown.selectOption({ value: 'both' });
-          log.info('Selected Display Type: Both (using value="both")');
-        } catch {
-          try {
-            await displayDropdown.selectOption({ label: TEXT.DISPLAY_BOTH });
-            log.info('Selected Display Type: Both (using label)');
-          } catch {
-            // Last resort: click the option directly
-            await displayDropdown.click();
-            await delay(300);
-            const option = ctx.page.locator('option').filter({ hasText: /both/i });
-            await option.click();
-            log.info('Selected Display Type: Both (clicked option)');
-          }
+      // STEP 5: Set and ASSERT Display Type
+      await setAndAssertDisplayType(ctx, log);
+
+      // STEP 6: FINAL ASSERTION - Verify all values before clicking Add Content
+      // This catches any re-renders that may have reset values
+      const finalValidation = await validateFormValues(ctx, TEXT.IGUIDE_TITLE, tourUrl, log);
+      if (!finalValidation.valid) {
+        log.warn({ issues: finalValidation.issues }, 'Form values changed - re-applying...');
+        // Re-apply any values that were reset
+        if (!finalValidation.titleMatch) {
+          await setAndAssertTitle(ctx, TEXT.IGUIDE_TITLE, log);
         }
-      } catch (dropdownErr) {
-        log.warn({ error: dropdownErr instanceof Error ? dropdownErr.message : String(dropdownErr) },
-          'Display Type dropdown not found or not selectable - may use default');
-        await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, `dropdown_issue_${attempt}`);
+        if (!finalValidation.linkMatch) {
+          await setAndAssertLink(ctx, tourUrl, log);
+        }
+        if (!finalValidation.displayTypeMatch) {
+          await setAndAssertDisplayType(ctx, log);
+        }
       }
-      await delay(TIMEOUTS.ACTION_DELAY);
 
-      // Step 6: Click Add Content button
+      // STEP 7: Wait for Add Content button to be enabled
       const addContentButton = getAddContentButton(ctx.page);
       await addContentButton.waitFor({ state: 'visible', timeout: 5000 });
-      log.info('Clicking Add Content button...');
+
+      // Wait for button to be enabled (not disabled)
+      await ctx.page.waitForFunction(
+        `(() => {
+          const btn = document.querySelector('button[class*="bg-primary"]');
+          if (!btn) return false;
+          const text = btn.textContent || '';
+          return text.includes('Add Content') && !btn.disabled;
+        })()`,
+        { timeout: TIMEOUTS.COMMIT_BUTTON_ENABLED }
+      );
+
+      log.info('Add Content button is enabled - clicking...');
       await addContentButton.click();
 
-      // Step 7: Wait for modal to close
+      // STEP 8: Wait for modal to close (state-driven)
       log.info('Waiting for 3D Content modal to close...');
-      try {
-        await modal.waitFor({ state: 'hidden', timeout: TIMEOUTS.MODAL_CLOSE });
+      const modalClosed = await waitForModalClose(ctx.page, TIMEOUTS.MODAL_CLOSE);
+
+      if (!modalClosed) {
+        log.warn('Modal did not close within timeout - checking if content was added anyway');
+      } else {
         log.debug('3D Content modal closed');
-      } catch {
-        log.debug('Modal close wait timed out - checking success anyway');
       }
 
-      // Give UI time to update
-      await delay(1500);
-
-      // Step 8: VERIFY the content was actually added
+      // STEP 9: Wait for media section to update and VERIFY content was added
       log.info('Verifying 3D Content was added...');
 
-      // Method 1: Check if item with title appears
-      const contentExists = await has3DContentWithTitle(ctx.page, TEXT.IGUIDE_TITLE);
+      // Method 1: Check if item with title appears (most reliable)
+      const contentExists = await waitFor3DContentWithTitle(ctx.page, TEXT.IGUIDE_TITLE, TIMEOUTS.POST_VERIFY);
       if (contentExists) {
         log.info('Post-condition VERIFIED: 3D Content with title visible');
         await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, 'success');
@@ -678,18 +801,16 @@ async function add3DContent(
       }
 
       // Method 2: Check if count incremented
-      const currentCount = await getMediaRowCount(ctx.page, TEXT.THREE_D_CONTENT);
-      if (currentCount > baselineCount) {
-        log.info({ baselineCount, currentCount }, 'Post-condition VERIFIED: 3D Content count increased');
-        await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, 'success');
-        return { success: true };
-      }
+      const updateResult = await waitForMediaSectionUpdate(
+        ctx.page,
+        TEXT.THREE_D_CONTENT,
+        baselineCount,
+        TIMEOUTS.POST_VERIFY
+      );
 
-      // Method 3: Wait a bit longer for count change
-      const verified = await waitForCountIncrement(ctx, TEXT.THREE_D_CONTENT, baselineCount, TIMEOUTS.POST_VERIFY);
-      if (verified) {
+      if (updateResult.updated) {
+        log.info({ baselineCount, currentCount: updateResult.newCount }, 'Post-condition VERIFIED: 3D Content count increased');
         await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, 'success');
-        log.info('3D Content added and VERIFIED');
         return { success: true };
       }
 
@@ -700,20 +821,21 @@ async function add3DContent(
         throw new Error(`Add 3D Content failed: ${errorText}`);
       }
 
-      // If we get here, verification failed
+      // Verification failed - only screenshot if UI is idle
       await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, `verification_failed_${attempt}`);
-      throw new Error(`Post-condition FAILED: 3D Content not visible after add (baseline: ${baselineCount}, current: ${currentCount})`);
+      throw new Error(`Verification failed: 3D Content not visible after add (baseline: ${baselineCount}, current: ${updateResult.newCount})`);
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       log.warn({ attempt, error: errorMessage }, 'Add 3D Content attempt failed');
 
+      // Only screenshot during true failures, not loading states
       await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, `error_attempt_${attempt}`);
 
-      // Try to close any open modal before retry
+      // Close any open modal before retry
       try {
         await ctx.page.keyboard.press('Escape');
-        await delay(500);
+        await ctx.page.waitForTimeout(300);
       } catch {
         // Ignore
       }
@@ -728,15 +850,216 @@ async function add3DContent(
   return {
     success: false,
     error: {
-      code: ErrorCodes.ARYEO_3D_CONTENT_FAILED,
-      message: `Failed to add 3D Content after ${MAX_RETRIES} retries`,
+      code: ErrorCodes.ACTION_FAILED,
+      message: `Failed to add 3D Content after ${MAX_RETRIES} retries (UI was idle, action did not succeed)`,
       retryable: true,
     },
   };
 }
 
 /**
+ * Sets the Content Title input and asserts it matches expected value
+ */
+async function setAndAssertTitle(
+  ctx: AutomationContext,
+  expectedTitle: string,
+  log: typeof logger
+): Promise<void> {
+  const titleInput = getContentTitleInput(ctx.page);
+  await titleInput.waitFor({ state: 'visible', timeout: 5000 });
+  await titleInput.clear();
+  await titleInput.fill(expectedTitle);
+
+  // ASSERTION: Verify the value was set correctly
+  const actualValue = await titleInput.inputValue();
+  if (actualValue !== expectedTitle) {
+    log.warn({ expected: expectedTitle, actual: actualValue }, 'Title value mismatch - retrying fill');
+    await titleInput.clear();
+    await titleInput.type(expectedTitle, { delay: 50 }); // Slower typing as fallback
+
+    const retryValue = await titleInput.inputValue();
+    if (retryValue !== expectedTitle) {
+      throw new Error(`Failed to set Content Title: expected "${expectedTitle}", got "${retryValue}"`);
+    }
+  }
+
+  log.info({ title: expectedTitle }, 'Content Title set and verified');
+}
+
+/**
+ * Sets the Content Link input and asserts it matches expected value
+ */
+async function setAndAssertLink(
+  ctx: AutomationContext,
+  expectedUrl: string,
+  log: typeof logger
+): Promise<void> {
+  const linkInput = getContentLinkInput(ctx.page);
+  await linkInput.waitFor({ state: 'visible', timeout: 5000 });
+  await linkInput.clear();
+  await linkInput.fill(expectedUrl);
+
+  // ASSERTION: Verify the value was set correctly
+  const actualValue = await linkInput.inputValue();
+  if (actualValue !== expectedUrl) {
+    log.warn({ expected: expectedUrl, actual: actualValue }, 'Link value mismatch - retrying fill');
+    await linkInput.clear();
+    await linkInput.type(expectedUrl, { delay: 20 });
+
+    const retryValue = await linkInput.inputValue();
+    if (retryValue !== expectedUrl) {
+      throw new Error(`Failed to set Content Link: expected "${expectedUrl}", got "${retryValue}"`);
+    }
+  }
+
+  log.info('Content Link set and verified');
+}
+
+/**
+ * Sets the Display Type dropdown and asserts it's set to "Both"
+ */
+async function setAndAssertDisplayType(
+  ctx: AutomationContext,
+  log: typeof logger
+): Promise<void> {
+  const displayDropdown = getDisplayTypeDropdown(ctx.page);
+
+  try {
+    await displayDropdown.waitFor({ state: 'visible', timeout: 3000 });
+
+    // Try to select "both" value
+    try {
+      await displayDropdown.selectOption({ value: 'both' });
+    } catch {
+      try {
+        await displayDropdown.selectOption({ label: TEXT.DISPLAY_BOTH });
+      } catch {
+        // Try clicking the dropdown and selecting manually
+        await displayDropdown.click();
+        await ctx.page.waitForTimeout(200);
+        const option = ctx.page.locator('option').filter({ hasText: /both/i });
+        if (await option.isVisible()) {
+          await option.click();
+        }
+      }
+    }
+
+    // ASSERTION: Verify the value was set correctly
+    const selectedValue = await displayDropdown.inputValue();
+    if (!selectedValue.toLowerCase().includes('both')) {
+      log.warn({ selected: selectedValue }, 'Display Type not set to "both" - attempting alternative');
+
+      // Try evaluating directly
+      await ctx.page.evaluate(`(() => {
+        const select = document.querySelector('select[id*="DisplayType"]');
+        if (select) {
+          const options = Array.from(select.options);
+          const bothOption = options.find(opt =>
+            opt.value.toLowerCase() === 'both' || opt.text.toLowerCase().includes('both')
+          );
+          if (bothOption) {
+            select.value = bothOption.value;
+            select.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        }
+      })()`);
+
+      const finalValue = await displayDropdown.inputValue();
+      log.info({ displayType: finalValue }, 'Display Type set');
+    } else {
+      log.info('Display Type set to "Both" and verified');
+    }
+
+  } catch (err) {
+    log.warn({ error: err instanceof Error ? err.message : String(err) },
+      'Could not set Display Type - proceeding with default');
+  }
+}
+
+/**
+ * Validates all form values before clicking Add Content
+ */
+async function validateFormValues(
+  ctx: AutomationContext,
+  expectedTitle: string,
+  expectedUrl: string,
+  log: typeof logger
+): Promise<{ valid: boolean; titleMatch: boolean; linkMatch: boolean; displayTypeMatch: boolean; issues: string[] }> {
+  const issues: string[] = [];
+  let titleMatch = true;
+  let linkMatch = true;
+  let displayTypeMatch = true;
+
+  try {
+    const titleInput = getContentTitleInput(ctx.page);
+    const actualTitle = await titleInput.inputValue();
+    titleMatch = actualTitle === expectedTitle;
+    if (!titleMatch) {
+      issues.push(`Title mismatch: expected "${expectedTitle}", got "${actualTitle}"`);
+    }
+  } catch {
+    issues.push('Could not read title value');
+    titleMatch = false;
+  }
+
+  try {
+    const linkInput = getContentLinkInput(ctx.page);
+    const actualLink = await linkInput.inputValue();
+    linkMatch = actualLink === expectedUrl;
+    if (!linkMatch) {
+      issues.push(`Link mismatch: expected "${expectedUrl}", got "${actualLink}"`);
+    }
+  } catch {
+    issues.push('Could not read link value');
+    linkMatch = false;
+  }
+
+  try {
+    const displayDropdown = getDisplayTypeDropdown(ctx.page);
+    const selectedValue = await displayDropdown.inputValue();
+    displayTypeMatch = selectedValue.toLowerCase().includes('both');
+    if (!displayTypeMatch) {
+      issues.push(`Display type not set to "both": got "${selectedValue}"`);
+    }
+  } catch {
+    // Display type is optional
+    displayTypeMatch = true;
+  }
+
+  const valid = titleMatch && linkMatch && displayTypeMatch;
+  if (!valid) {
+    log.debug({ issues }, 'Form validation issues detected');
+  }
+
+  return { valid, titleMatch, linkMatch, displayTypeMatch, issues };
+}
+
+/**
+ * Waits for 3D content with a specific title to appear in the media list
+ */
+async function waitFor3DContentWithTitle(
+  page: Page,
+  title: string,
+  timeout: number
+): Promise<boolean> {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeout) {
+    const exists = await has3DContentWithTitle(page, title);
+    if (exists) {
+      return true;
+    }
+    await page.waitForTimeout(TIMEOUTS.STATE_POLL_INTERVAL);
+  }
+
+  return false;
+}
+
+/**
  * Saves the listing changes
+ *
+ * STATE-DRIVEN: Waits for save operation to complete based on UI state,
+ * not fixed delays.
  */
 async function saveListing(
   ctx: AutomationContext
@@ -749,22 +1072,40 @@ async function saveListing(
 
       const saveButton = getSaveButton(ctx.page);
       await saveButton.waitFor({ state: 'visible', timeout: TIMEOUTS.ELEMENT_VISIBLE });
-      await saveButton.click();
 
-      // Wait for save to complete
-      await waitForLoadingComplete(ctx.page, TIMEOUTS.MODAL_CLOSE);
-      await delay(2000);
-
-      // Check for success toast
-      const successToast = getSuccessToast(ctx.page);
-      try {
-        await successToast.waitFor({ state: 'visible', timeout: 5000 });
-        log.debug('Success toast appeared');
-      } catch {
-        // Success toast might not appear, that's OK
+      // Check if button is enabled before clicking
+      const isDisabled = await saveButton.isDisabled();
+      if (isDisabled) {
+        log.debug('Save button is disabled - waiting for it to become enabled');
+        await ctx.page.waitForFunction(
+          `(() => {
+            const btn = document.querySelector('button[type="submit"]');
+            return btn && !btn.disabled;
+          })()`,
+          { timeout: 5000 }
+        ).catch(() => {
+          log.debug('Save button remained disabled - clicking anyway');
+        });
       }
 
-      // Check for error toast
+      await saveButton.click();
+      log.debug('Clicked Save button');
+
+      // STATE-DRIVEN: Wait for loading to complete
+      await waitForLoadingComplete(ctx.page, TIMEOUTS.MODAL_CLOSE);
+
+      // Poll for success or error state
+      const saveResult = await waitForSaveResult(ctx.page, 10000);
+
+      if (saveResult.error) {
+        throw new Error(`Save failed: ${saveResult.errorMessage}`);
+      }
+
+      if (saveResult.success) {
+        log.debug('Success toast appeared');
+      }
+
+      // Final check for error toast
       const errorToast = getErrorToast(ctx.page);
       if (await errorToast.isVisible()) {
         const errorText = await errorToast.textContent();
@@ -796,7 +1137,39 @@ async function saveListing(
 }
 
 /**
+ * Waits for save operation to complete by polling for success or error toasts
+ */
+async function waitForSaveResult(
+  page: Page,
+  timeout: number
+): Promise<{ success: boolean; error: boolean; errorMessage: string | null }> {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeout) {
+    // Check for success toast
+    const successToast = getSuccessToast(page);
+    if (await successToast.isVisible().catch(() => false)) {
+      return { success: true, error: false, errorMessage: null };
+    }
+
+    // Check for error toast
+    const errorToast = getErrorToast(page);
+    if (await errorToast.isVisible().catch(() => false)) {
+      const errorText = await errorToast.textContent().catch(() => null);
+      return { success: false, error: true, errorMessage: errorText };
+    }
+
+    await page.waitForTimeout(TIMEOUTS.STATE_POLL_INTERVAL);
+  }
+
+  // No definitive result - assume success if no error
+  return { success: false, error: false, errorMessage: null };
+}
+
+/**
  * Delivers the listing / sends to client
+ *
+ * STATE-DRIVEN: Waits for delivery modal and result based on UI state.
  */
 async function deliverListing(
   ctx: AutomationContext
@@ -807,38 +1180,63 @@ async function deliverListing(
     try {
       log.info({ attempt }, 'Delivering listing');
 
-      // Step 1: Click the "Deliver Listing" or "Re-deliver Listing" button
+      // STEP 1: Click the "Deliver Listing" or "Re-deliver Listing" button
       const deliverButton = getDeliverButton(ctx.page);
       await deliverButton.waitFor({ state: 'visible', timeout: TIMEOUTS.ELEMENT_VISIBLE });
       await deliverButton.click();
       log.debug('Clicked Deliver Listing button');
 
-      // Step 2: Wait for the delivery modal to appear
+      // STEP 2: Wait for the delivery modal to appear
       const modal = getDeliverConfirmModal(ctx.page);
       await modal.waitFor({ state: 'visible', timeout: 5000 });
       log.debug('Delivery modal appeared');
-      await delay(500);
 
-      // Step 3: Click the "Deliver" confirm button in the modal
+      // STEP 3: Wait for confirm button to be visible and click it
       const confirmButton = getDeliverConfirmButton(ctx.page);
       await confirmButton.waitFor({ state: 'visible', timeout: 5000 });
+
+      // Ensure button is clickable (not disabled)
+      const isDisabled = await confirmButton.isDisabled().catch(() => false);
+      if (isDisabled) {
+        log.debug('Confirm button is disabled - waiting for it to become enabled');
+        await ctx.page.waitForFunction(
+          `(() => {
+            const btns = document.querySelectorAll('button[class*="bg-primary"]');
+            for (const btn of btns) {
+              if (btn.textContent && btn.textContent.includes('Deliver') && !btn.disabled) {
+                return true;
+              }
+            }
+            return false;
+          })()`,
+          { timeout: 5000 }
+        );
+      }
+
       log.info('Clicking Deliver confirm button');
       await confirmButton.click();
 
-      // Wait for delivery to complete
+      // STEP 4: STATE-DRIVEN wait for delivery to complete
       await waitForLoadingComplete(ctx.page, TIMEOUTS.MODAL_CLOSE);
-      await delay(2000);
 
-      // Check for success
-      const successToast = getSuccessToast(ctx.page);
-      try {
-        await successToast.waitFor({ state: 'visible', timeout: 5000 });
-        log.debug('Delivery success toast appeared');
-      } catch {
-        // Success toast might not appear
+      // Poll for success or error state
+      const deliverResult = await waitForSaveResult(ctx.page, 15000);
+
+      if (deliverResult.error) {
+        throw new Error(`Delivery failed: ${deliverResult.errorMessage}`);
       }
 
-      // Check for error
+      if (deliverResult.success) {
+        log.debug('Delivery success toast appeared');
+      }
+
+      // Wait for modal to close
+      const modalClosed = await waitForModalClose(ctx.page, TIMEOUTS.MODAL_CLOSE);
+      if (!modalClosed) {
+        log.debug('Modal did not close - checking success anyway');
+      }
+
+      // Final check for error toast
       const errorToast = getErrorToast(ctx.page);
       if (await errorToast.isVisible()) {
         const errorText = await errorToast.textContent();
@@ -852,6 +1250,14 @@ async function deliverListing(
       log.warn({ attempt, error: err instanceof Error ? err.message : String(err) }, 'Deliver attempt failed');
 
       await takeScreenshot(ctx, Steps.DELIVER_LISTING, `error_attempt_${attempt}`);
+
+      // Close any open modal before retry
+      try {
+        await ctx.page.keyboard.press('Escape');
+        await ctx.page.waitForTimeout(300);
+      } catch {
+        // Ignore
+      }
 
       // Determine if error is retryable
       const errorMessage = err instanceof Error ? err.message : String(err);

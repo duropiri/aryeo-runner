@@ -15,17 +15,21 @@ import type { Page, Locator } from 'playwright';
 
 export const TIMEOUTS = {
   // URL staging (file download/processing) - can be slow for large files
-  URL_STAGING: 60000,
-  // Wait for commit button to be enabled
-  COMMIT_BUTTON_ENABLED: 20000,
+  URL_STAGING: 90000,
+  // Wait for commit button to be enabled after staging complete
+  COMMIT_BUTTON_ENABLED: 30000,
   // Modal close after commit
-  MODAL_CLOSE: 30000,
+  MODAL_CLOSE: 45000,
   // Post-condition verification (count changed, item appeared)
-  POST_VERIFY: 30000,
+  POST_VERIFY: 45000,
   // Default element visibility
   ELEMENT_VISIBLE: 10000,
-  // Short action delay
-  ACTION_DELAY: 500,
+  // State polling interval (how often to check UI state)
+  STATE_POLL_INTERVAL: 250,
+  // Maximum time to wait for upload progress to complete
+  UPLOAD_PROGRESS_COMPLETE: 120000,
+  // Time to wait for media section re-render after modal closes
+  MEDIA_SECTION_RERENDER: 10000,
 } as const;
 
 // ============================================================================
@@ -611,4 +615,416 @@ export async function waitForAnyVisible(
   }
 
   return null;
+}
+
+// ============================================================================
+// STATE-DRIVEN UPLOAD DETECTION
+// ============================================================================
+
+/**
+ * Upload state for deterministic automation
+ */
+export interface UploadUIState {
+  hasProgressBar: boolean;
+  progressPercent: number | null;
+  hasSkeletonLoader: boolean;
+  hasSpinnerInModal: boolean;
+  hasStagedFile: boolean;
+  hasRealFilename: boolean;
+  isAddFilesButtonEnabled: boolean;
+  isAddFilesButtonVisible: boolean;
+  hasErrorMessage: boolean;
+  errorMessage: string | null;
+}
+
+/**
+ * Gets the upload progress bar element in the Uploadcare widget
+ * Progress is shown as a bar during file download/processing
+ */
+export function getUploadProgressBar(page: Page): Locator {
+  return page.locator('uc-progress-bar, [class*="uc-progress"], [class*="progress-bar"], [role="progressbar"]')
+    .or(page.locator('.uc-file-item [class*="progress"]'))
+    .or(page.locator('uc-file-item [class*="uploading"]'));
+}
+
+/**
+ * Gets skeleton/placeholder loaders in the upload widget
+ * These appear when a file is being processed but not yet ready
+ */
+export function getSkeletonLoader(page: Page): Locator {
+  return page.locator('[class*="skeleton"], [class*="placeholder"], [class*="loading-placeholder"]')
+    .or(page.locator('uc-file-item[data-state="uploading"]'))
+    .or(page.locator('uc-file-item[data-state="processing"]'))
+    .or(page.locator('.uc-file-item--uploading, .uc-file-item--processing'));
+}
+
+/**
+ * Gets loading spinners specifically within the upload modal area
+ */
+export function getUploadModalSpinner(page: Page): Locator {
+  return page.locator('uc-file-uploader-inline [class*="spinner"], uc-file-uploader-inline [class*="loading"]')
+    .or(page.locator('uc-activity-icon, uc-spinner'))
+    .or(page.locator('.uc-upload-list [aria-busy="true"]'));
+}
+
+/**
+ * Gets file items that have completed staging (have real filenames, not placeholders)
+ * A staged file should show actual filename text, thumbnail, or completion indicator
+ */
+export function getCompletedStagedFile(page: Page): Locator {
+  // Files that have completed staging have a done state or show file info
+  return page.locator('uc-file-item[data-state="idle"], uc-file-item[data-state="done"]')
+    .or(page.locator('.uc-file-item--done, .uc-file-item--idle'))
+    .or(page.locator('uc-file-item:not([data-state="uploading"]):not([data-state="processing"])'));
+}
+
+/**
+ * Gets the filename text element within a staged file item
+ */
+export function getStagedFileName(page: Page): Locator {
+  return page.locator('uc-file-item .uc-file-name, uc-file-item [class*="file-name"]')
+    .or(page.locator('.uc-file-item__name'))
+    .or(page.locator('uc-upload-list [class*="filename"]'));
+}
+
+/**
+ * Gets the thumbnail/preview image for a staged file
+ */
+export function getStagedFileThumbnail(page: Page): Locator {
+  return page.locator('uc-file-item img, uc-file-item [class*="thumb"], uc-file-item [class*="preview"]')
+    .or(page.locator('.uc-file-item__thumb, .uc-file-item__preview'));
+}
+
+/**
+ * Comprehensive function to capture the current upload UI state
+ * This is the key function for state-driven automation
+ */
+export async function getUploadUIState(page: Page): Promise<UploadUIState> {
+  const state: UploadUIState = {
+    hasProgressBar: false,
+    progressPercent: null,
+    hasSkeletonLoader: false,
+    hasSpinnerInModal: false,
+    hasStagedFile: false,
+    hasRealFilename: false,
+    isAddFilesButtonEnabled: false,
+    isAddFilesButtonVisible: false,
+    hasErrorMessage: false,
+    errorMessage: null,
+  };
+
+  try {
+    // Check for progress bar
+    const progressBar = getUploadProgressBar(page);
+    state.hasProgressBar = await progressBar.isVisible().catch(() => false);
+
+    if (state.hasProgressBar) {
+      // Try to extract progress percentage
+      try {
+        const progressValue = await progressBar.getAttribute('aria-valuenow');
+        if (progressValue) {
+          state.progressPercent = parseInt(progressValue, 10);
+        } else {
+          // Try style width for CSS-based progress bars
+          const style = await progressBar.getAttribute('style');
+          if (style) {
+            const widthMatch = style.match(/width:\s*(\d+(?:\.\d+)?)%/);
+            if (widthMatch && widthMatch[1]) {
+              state.progressPercent = parseFloat(widthMatch[1]);
+            }
+          }
+        }
+      } catch {
+        // Could not extract percentage
+      }
+    }
+
+    // Check for skeleton loaders
+    const skeleton = getSkeletonLoader(page);
+    state.hasSkeletonLoader = await skeleton.isVisible().catch(() => false);
+
+    // Check for spinners in modal
+    const spinner = getUploadModalSpinner(page);
+    state.hasSpinnerInModal = await spinner.isVisible().catch(() => false);
+
+    // Check for staged file preview
+    const stagedPreview = getStagedFilePreview(page);
+    state.hasStagedFile = await stagedPreview.isVisible().catch(() => false);
+
+    // Check if staged file has a real filename (not placeholder)
+    if (state.hasStagedFile) {
+      const filename = getStagedFileName(page);
+      const thumbnail = getStagedFileThumbnail(page);
+      const completedFile = getCompletedStagedFile(page);
+
+      const hasFilename = await filename.isVisible().catch(() => false);
+      const hasThumbnail = await thumbnail.isVisible().catch(() => false);
+      const isCompleted = await completedFile.isVisible().catch(() => false);
+
+      state.hasRealFilename = hasFilename || hasThumbnail || isCompleted;
+    }
+
+    // Check Add Files button state
+    const addFilesButton = getCommitFilesButton(page);
+    state.isAddFilesButtonVisible = await addFilesButton.isVisible().catch(() => false);
+
+    if (state.isAddFilesButtonVisible) {
+      const isDisabled = await addFilesButton.isDisabled().catch(() => true);
+      state.isAddFilesButtonEnabled = !isDisabled;
+    }
+
+    // Check for error messages
+    const errorToast = getErrorToast(page);
+    state.hasErrorMessage = await errorToast.isVisible().catch(() => false);
+
+    if (state.hasErrorMessage) {
+      state.errorMessage = await errorToast.textContent().catch(() => null);
+    }
+
+  } catch {
+    // Return partial state on error
+  }
+
+  return state;
+}
+
+/**
+ * Determines if the upload is still in progress based on UI state
+ */
+export function isUploadInProgress(state: UploadUIState): boolean {
+  // Upload is in progress if:
+  // - Progress bar is visible AND not at 100%
+  // - Skeleton loaders are visible
+  // - Spinner is visible in modal
+  // - Add Files button is visible but disabled (processing)
+
+  if (state.hasProgressBar && (state.progressPercent === null || state.progressPercent < 100)) {
+    return true;
+  }
+
+  if (state.hasSkeletonLoader) {
+    return true;
+  }
+
+  if (state.hasSpinnerInModal) {
+    return true;
+  }
+
+  // If staged file exists but no real filename yet, still processing
+  if (state.hasStagedFile && !state.hasRealFilename) {
+    return true;
+  }
+
+  // If button is visible but disabled, still processing
+  if (state.isAddFilesButtonVisible && !state.isAddFilesButtonEnabled) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Determines if the UI is ready for the "Add Files" action
+ */
+export function isUIReadyForCommit(state: UploadUIState): boolean {
+  // UI is ready when:
+  // - No progress bar OR progress at 100%
+  // - No skeleton loaders
+  // - No spinner in modal
+  // - Staged file has real filename OR thumbnail
+  // - Add Files button is visible AND enabled
+  // - No error message
+
+  if (state.hasErrorMessage) {
+    return false;
+  }
+
+  if (state.hasProgressBar && state.progressPercent !== null && state.progressPercent < 100) {
+    return false;
+  }
+
+  if (state.hasSkeletonLoader) {
+    return false;
+  }
+
+  if (state.hasSpinnerInModal) {
+    return false;
+  }
+
+  if (state.hasStagedFile && !state.hasRealFilename) {
+    return false;
+  }
+
+  return state.isAddFilesButtonVisible && state.isAddFilesButtonEnabled;
+}
+
+/**
+ * Waits for the upload to complete and UI to be ready for commit
+ * This is the state-machine approach - no blind delays
+ * @returns Object with ready status and final state
+ */
+export async function waitForUploadReadyState(
+  page: Page,
+  timeout: number = TIMEOUTS.UPLOAD_PROGRESS_COMPLETE
+): Promise<{ ready: boolean; state: UploadUIState; reason: string }> {
+  const startTime = Date.now();
+  let lastState: UploadUIState = await getUploadUIState(page);
+  let stableCount = 0;
+  const requiredStableChecks = 3; // Must be stable for 3 consecutive checks
+
+  while (Date.now() - startTime < timeout) {
+    const currentState = await getUploadUIState(page);
+
+    // Check for error state first
+    if (currentState.hasErrorMessage) {
+      return {
+        ready: false,
+        state: currentState,
+        reason: `Upload error: ${currentState.errorMessage || 'Unknown error'}`,
+      };
+    }
+
+    // Check if ready for commit
+    if (isUIReadyForCommit(currentState)) {
+      stableCount++;
+      if (stableCount >= requiredStableChecks) {
+        return {
+          ready: true,
+          state: currentState,
+          reason: 'Upload complete and UI ready for commit',
+        };
+      }
+    } else {
+      stableCount = 0; // Reset stability counter if state changes
+    }
+
+    // Log progress for debugging
+    if (currentState.hasProgressBar && currentState.progressPercent !== null) {
+      // Progress is being made
+    }
+
+    lastState = currentState;
+    await page.waitForTimeout(TIMEOUTS.STATE_POLL_INTERVAL);
+  }
+
+  // Timeout - determine why
+  if (isUploadInProgress(lastState)) {
+    return {
+      ready: false,
+      state: lastState,
+      reason: 'Timeout: upload still in progress',
+    };
+  }
+
+  if (!lastState.hasStagedFile) {
+    return {
+      ready: false,
+      state: lastState,
+      reason: 'Timeout: no staged file appeared',
+    };
+  }
+
+  if (!lastState.isAddFilesButtonVisible) {
+    return {
+      ready: false,
+      state: lastState,
+      reason: 'Timeout: Add Files button not visible',
+    };
+  }
+
+  if (!lastState.isAddFilesButtonEnabled) {
+    return {
+      ready: false,
+      state: lastState,
+      reason: 'Timeout: Add Files button not enabled',
+    };
+  }
+
+  return {
+    ready: false,
+    state: lastState,
+    reason: 'Timeout: unknown state issue',
+  };
+}
+
+// ============================================================================
+// MEDIA SECTION VERIFICATION
+// ============================================================================
+
+/**
+ * Gets all visible file items in a media row (for counting and verification)
+ */
+export function getMediaRowItems(page: Page, rowLabel: string): Locator {
+  const row = getMediaRow(page, rowLabel);
+  return row.locator('[class*="item"], [class*="file"], [class*="media"], li');
+}
+
+/**
+ * Checks if a specific filename appears in the media row
+ */
+export async function hasFileInMediaRow(page: Page, rowLabel: string, filename: string): Promise<boolean> {
+  try {
+    const row = getMediaRow(page, rowLabel);
+    const fileWithName = row.locator(`text=${filename}`)
+      .or(row.locator(`[title*="${filename}"]`))
+      .or(row.locator(`[alt*="${filename}"]`));
+    return await fileWithName.isVisible({ timeout: 2000 });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Waits for the media section to re-render after modal closes
+ * Detects when the listing media section has updated with new content
+ */
+export async function waitForMediaSectionUpdate(
+  page: Page,
+  rowLabel: string,
+  baselineCount: number,
+  timeout: number = TIMEOUTS.MEDIA_SECTION_RERENDER
+): Promise<{ updated: boolean; newCount: number }> {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeout) {
+    const currentCount = await getMediaRowCount(page, rowLabel);
+
+    if (currentCount > baselineCount) {
+      return { updated: true, newCount: currentCount };
+    }
+
+    await page.waitForTimeout(TIMEOUTS.STATE_POLL_INTERVAL);
+  }
+
+  const finalCount = await getMediaRowCount(page, rowLabel);
+  return { updated: finalCount > baselineCount, newCount: finalCount };
+}
+
+/**
+ * Checks if a modal is currently open
+ */
+export async function isModalOpen(page: Page): Promise<boolean> {
+  try {
+    const modal = getUploadModal(page);
+    return await modal.isVisible();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Waits for any modal to close completely
+ */
+export async function waitForModalClose(page: Page, timeout: number = TIMEOUTS.MODAL_CLOSE): Promise<boolean> {
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < timeout) {
+    const modalOpen = await isModalOpen(page);
+    if (!modalOpen) {
+      return true;
+    }
+    await page.waitForTimeout(TIMEOUTS.STATE_POLL_INTERVAL);
+  }
+
+  return false;
 }
