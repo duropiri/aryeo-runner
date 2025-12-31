@@ -30,6 +30,10 @@ export const TIMEOUTS = {
   MEDIA_SECTION_RERENDER: 15000,
   // Exponential backoff intervals for count verification
   BACKOFF_INTERVALS: [2000, 4000, 8000, 15000, 30000] as readonly number[],
+  // Extended backoff for post-reload verification
+  POST_RELOAD_VERIFY: 30000,
+  // Checkbox interaction timeout
+  CHECKBOX_INTERACT: 5000,
 } as const;
 
 // ============================================================================
@@ -918,6 +922,171 @@ export const isUIReadyForCommit = isReadyToClickAdd;
 export const waitForUploadReadyState = waitForAddButtonEnabled;
 
 // ============================================================================
+// ASSET EXISTENCE CHECK (PREFLIGHT & VERIFICATION)
+// ============================================================================
+
+/**
+ * Result of checking if an asset exists in the media section
+ */
+export interface AssetExistsResult {
+  exists: boolean;
+  matchMethod: 'filename_text' | 'filename_attribute' | 'url_fragment' | 'none';
+  matchedElement?: string; // Description of what matched
+}
+
+/**
+ * Checks if an asset already exists in a media section row.
+ *
+ * This is the PREFLIGHT check that prevents duplicate imports.
+ *
+ * Search order:
+ * 1. Text node containing the filename (decodedFilename)
+ * 2. Element attribute containing filename (alt/title/aria-label/href/src)
+ * 3. Fallback: URL's last path segment
+ *
+ * @param page - Playwright page
+ * @param rowLabel - Media section row label (e.g., TEXT.FLOOR_PLANS)
+ * @param decodedFilename - The decoded filename to search for
+ * @param urlPathFragment - The last path segment from the URL (fallback)
+ * @returns AssetExistsResult with exists status and match method
+ */
+export async function preflightAssetExists(
+  page: Page,
+  rowLabel: string,
+  decodedFilename: string,
+  urlPathFragment: string
+): Promise<AssetExistsResult> {
+  const row = getMediaRow(page, rowLabel);
+
+  // Normalize filename for comparison (remove extension variations, etc.)
+  const filenameNormalized = decodedFilename.toLowerCase().trim();
+  const fragmentNormalized = urlPathFragment.toLowerCase().trim();
+
+  try {
+    // Strategy 1: Look for text node containing the filename
+    if (decodedFilename) {
+      // Use a case-insensitive search
+      const textMatch = row.locator(`text=${decodedFilename}`)
+        .or(row.locator(`*:has-text("${decodedFilename}")`));
+
+      if (await textMatch.first().isVisible({ timeout: 1000 }).catch(() => false)) {
+        return {
+          exists: true,
+          matchMethod: 'filename_text',
+          matchedElement: `Text containing "${decodedFilename}"`,
+        };
+      }
+    }
+
+    // Strategy 2: Look for attribute containing the filename
+    // Search in alt, title, aria-label, href, src attributes
+    if (decodedFilename) {
+      const attrSelectors = [
+        `[alt*="${decodedFilename}" i]`,
+        `[title*="${decodedFilename}" i]`,
+        `[aria-label*="${decodedFilename}" i]`,
+        `[href*="${encodeURIComponent(decodedFilename)}"]`,
+        `[src*="${encodeURIComponent(decodedFilename)}"]`,
+      ];
+
+      for (const selector of attrSelectors) {
+        try {
+          const attrMatch = row.locator(selector).first();
+          if (await attrMatch.isVisible({ timeout: 500 }).catch(() => false)) {
+            return {
+              exists: true,
+              matchMethod: 'filename_attribute',
+              matchedElement: `Attribute matching "${decodedFilename}"`,
+            };
+          }
+        } catch {
+          // Continue to next selector
+        }
+      }
+    }
+
+    // Strategy 3: Fallback - search for URL path fragment
+    if (urlPathFragment && urlPathFragment !== decodedFilename) {
+      const fragmentMatch = row.locator(`text=${urlPathFragment}`)
+        .or(row.locator(`[href*="${urlPathFragment}"]`))
+        .or(row.locator(`[src*="${urlPathFragment}"]`));
+
+      if (await fragmentMatch.first().isVisible({ timeout: 500 }).catch(() => false)) {
+        return {
+          exists: true,
+          matchMethod: 'url_fragment',
+          matchedElement: `URL fragment "${urlPathFragment}"`,
+        };
+      }
+    }
+
+  } catch {
+    // Search failed, assume not exists
+  }
+
+  return {
+    exists: false,
+    matchMethod: 'none',
+  };
+}
+
+/**
+ * Waits for an asset to appear in the media section with exponential backoff.
+ * Used for POST-IMPORT verification.
+ *
+ * @param page - Playwright page
+ * @param rowLabel - Media section row label
+ * @param decodedFilename - The decoded filename to wait for
+ * @param urlPathFragment - URL path fragment fallback
+ * @param timeout - Maximum time to wait
+ * @returns AssetExistsResult
+ */
+export async function waitForAssetExists(
+  page: Page,
+  rowLabel: string,
+  decodedFilename: string,
+  urlPathFragment: string,
+  timeout: number = TIMEOUTS.COUNT_VERIFICATION
+): Promise<AssetExistsResult> {
+  const startTime = Date.now();
+  const backoffIntervals = TIMEOUTS.BACKOFF_INTERVALS;
+  let backoffIndex = 0;
+
+  while (Date.now() - startTime < timeout) {
+    const result = await preflightAssetExists(page, rowLabel, decodedFilename, urlPathFragment);
+    if (result.exists) {
+      return result;
+    }
+
+    // Wait with exponential backoff
+    const waitTime = backoffIntervals[Math.min(backoffIndex, backoffIntervals.length - 1)] ?? 5000;
+    await page.waitForTimeout(waitTime);
+    backoffIndex++;
+  }
+
+  return {
+    exists: false,
+    matchMethod: 'none',
+  };
+}
+
+/**
+ * Dumps the HTML content of the upload modal for debugging.
+ * Returns null if modal is not visible.
+ */
+export async function dumpUploadModalHtml(page: Page): Promise<string | null> {
+  try {
+    const modal = getUploadModal(page);
+    if (await modal.isVisible({ timeout: 1000 }).catch(() => false)) {
+      return await modal.innerHTML();
+    }
+  } catch {
+    // Modal not found
+  }
+  return null;
+}
+
+// ============================================================================
 // MEDIA SECTION VERIFICATION
 // ============================================================================
 
@@ -997,4 +1166,184 @@ export async function waitForModalClose(page: Page, timeout: number = TIMEOUTS.M
   }
 
   return false;
+}
+
+// ============================================================================
+// CHECKBOX INTERACTION HELPERS
+// ============================================================================
+
+/**
+ * Result of resolving and interacting with a checkbox
+ */
+export interface CheckboxInteractionResult {
+  success: boolean;
+  error?: string;
+  method?: 'checkbox_check' | 'label_click' | 'force_check';
+  isChecked?: boolean;
+  modalHtml?: string | null; // HTML dump on failure
+}
+
+/**
+ * Robustly finds and checks the "Set titles from filenames" checkbox.
+ *
+ * Steps:
+ * 1. Find the label containing "Set titles from filenames"
+ * 2. Resolve the checkbox input:
+ *    - If label has for="X", locate #X and ensure it's input[type=checkbox]
+ *    - Else find input[type=checkbox] within the label
+ *    - Else search nearby container for matching checkbox
+ * 3. Call checkbox.check({ force: true })
+ * 4. Verify checkbox.isChecked() === true
+ *
+ * @param page - Playwright page
+ * @returns CheckboxInteractionResult
+ */
+export async function findAndCheckSetTitlesCheckbox(page: Page): Promise<CheckboxInteractionResult> {
+  let checkboxLocator: Locator | null = null;
+  let resolveMethod = '';
+
+  try {
+    // Step 1: Find the label
+    const labelLocator = page.locator('label').filter({ hasText: /set titles from filenames/i });
+    const labelVisible = await labelLocator.isVisible({ timeout: TIMEOUTS.CHECKBOX_INTERACT }).catch(() => false);
+
+    if (!labelVisible) {
+      // Try role-based selector as fallback
+      const roleCheckbox = page.getByRole('checkbox', { name: /set titles from filenames/i });
+      if (await roleCheckbox.isVisible({ timeout: 2000 }).catch(() => false)) {
+        checkboxLocator = roleCheckbox;
+        resolveMethod = 'role_based';
+      } else {
+        return {
+          success: false,
+          error: 'Could not find "Set titles from filenames" label or checkbox',
+          modalHtml: await dumpUploadModalHtml(page),
+        };
+      }
+    } else {
+      // Step 2: Resolve the checkbox from the label
+      // Check if label has for="X" attribute
+      const forAttr = await labelLocator.getAttribute('for');
+
+      if (forAttr) {
+        // Label points to an element by ID
+        // Escape special characters in the ID for CSS selector (CSS.escape not available in Node.js)
+        const escapedId = forAttr.replace(/([!"#$%&'()*+,.\/:;<=>?@[\\\]^`{|}~])/g, '\\$1');
+        const targetElement = page.locator(`#${escapedId}`);
+        const tagName = await targetElement.evaluate(el => el.tagName.toLowerCase()).catch(() => '');
+        const inputType = await targetElement.getAttribute('type').catch(() => '');
+
+        if (tagName === 'input' && inputType === 'checkbox') {
+          checkboxLocator = targetElement;
+          resolveMethod = 'label_for_attribute';
+        } else {
+          // The for attribute points to something that's not a checkbox
+          // Look inside that element for a checkbox
+          checkboxLocator = targetElement.locator('input[type="checkbox"]').first();
+          resolveMethod = 'label_for_nested';
+        }
+      } else {
+        // No for attribute - look for checkbox inside the label
+        checkboxLocator = labelLocator.locator('input[type="checkbox"]').first();
+        resolveMethod = 'label_nested';
+
+        // If not found inside label, try sibling
+        if (!await checkboxLocator.isVisible({ timeout: 1000 }).catch(() => false)) {
+          // Try finding input as a sibling
+          checkboxLocator = labelLocator.locator('xpath=preceding-sibling::input[@type="checkbox"] | following-sibling::input[@type="checkbox"]').first();
+          resolveMethod = 'label_sibling';
+        }
+      }
+    }
+
+    // Verify we have a checkbox locator
+    if (!checkboxLocator) {
+      return {
+        success: false,
+        error: 'Could not resolve checkbox from label',
+        modalHtml: await dumpUploadModalHtml(page),
+      };
+    }
+
+    // Check if checkbox is visible
+    const isVisible = await checkboxLocator.isVisible({ timeout: 2000 }).catch(() => false);
+    if (!isVisible) {
+      // Try clicking the label as fallback
+      const label = page.locator('label').filter({ hasText: /set titles from filenames/i });
+      try {
+        await label.click({ force: true });
+        // Verify by checking if any checkbox nearby is now checked
+        await page.waitForTimeout(300);
+
+        // Look for any checked checkbox near the label
+        const nearbyChecked = label.locator('input[type="checkbox"]:checked')
+          .or(label.locator('xpath=preceding-sibling::input[@type="checkbox"][@checked]'))
+          .or(label.locator('xpath=following-sibling::input[@type="checkbox"][@checked]'));
+
+        if (await nearbyChecked.isVisible({ timeout: 1000 }).catch(() => false)) {
+          return {
+            success: true,
+            method: 'label_click',
+            isChecked: true,
+          };
+        }
+
+        // Still try to verify via role
+        const roleCheck = page.getByRole('checkbox', { name: /set titles from filenames/i });
+        if (await roleCheck.isChecked().catch(() => false)) {
+          return {
+            success: true,
+            method: 'label_click',
+            isChecked: true,
+          };
+        }
+
+        return {
+          success: false,
+          error: 'Clicked label but could not verify checkbox state',
+          modalHtml: await dumpUploadModalHtml(page),
+        };
+      } catch (labelErr) {
+        return {
+          success: false,
+          error: `Checkbox not visible and label click failed: ${labelErr instanceof Error ? labelErr.message : String(labelErr)}`,
+          modalHtml: await dumpUploadModalHtml(page),
+        };
+      }
+    }
+
+    // Step 3: Check the checkbox with force
+    await checkboxLocator.check({ force: true });
+
+    // Step 4: Verify isChecked === true
+    const isChecked = await checkboxLocator.isChecked();
+    if (!isChecked) {
+      // Try one more time with click
+      await checkboxLocator.click({ force: true });
+      await page.waitForTimeout(200);
+
+      const isCheckedRetry = await checkboxLocator.isChecked();
+      if (!isCheckedRetry) {
+        return {
+          success: false,
+          error: `Checkbox.check() succeeded but isChecked() returned false (resolve method: ${resolveMethod})`,
+          isChecked: false,
+          modalHtml: await dumpUploadModalHtml(page),
+        };
+      }
+    }
+
+    return {
+      success: true,
+      method: 'force_check',
+      isChecked: true,
+    };
+
+  } catch (err) {
+    return {
+      success: false,
+      error: `Exception during checkbox interaction: ${err instanceof Error ? err.message : String(err)}`,
+      modalHtml: await dumpUploadModalHtml(page),
+    };
+  }
 }

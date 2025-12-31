@@ -2,7 +2,7 @@ import { Queue } from 'bullmq';
 import Redis from 'ioredis';
 import { getConfig } from './config.js';
 import { logger } from './logger.js';
-import type { Manifest, RunState, RunStatusType } from './types.js';
+import type { Manifest, RunState, RunStatusType, ImportProgress } from './types.js';
 import { RunStatus } from './types.js';
 
 const QUEUE_NAME = 'aryeo-delivery';
@@ -122,7 +122,7 @@ export async function getRunStateByIdempotencyKey(idempotencyKey: string): Promi
 export async function updateRunStatus(
   runId: string,
   status: RunStatusType,
-  updates?: Partial<Pick<RunState, 'error' | 'assets_found' | 'evidence' | 'current_step' | 'actions'>>
+  updates?: Partial<Pick<RunState, 'error' | 'assets_found' | 'evidence' | 'current_step' | 'actions' | 'current_step_detail' | 'progress'>>
 ): Promise<RunState | null> {
   const runState = await getRunState(runId);
   if (!runState) {
@@ -146,6 +146,40 @@ export async function updateRunStatus(
 
   await setRunState(updatedState);
   return updatedState;
+}
+
+/**
+ * Updates progress details without changing status
+ * This is a lightweight update for frequent progress changes
+ */
+export async function updateProgress(
+  runId: string,
+  stepDetail: string,
+  progress: ImportProgress
+): Promise<void> {
+  const runState = await getRunState(runId);
+  if (!runState) {
+    logger.warn({ run_id: runId }, 'Cannot update progress for unknown run');
+    return;
+  }
+
+  runState.current_step_detail = stepDetail;
+  runState.progress = progress;
+  runState.updated_at = new Date().toISOString();
+
+  await setRunState(runState);
+
+  logger.debug(
+    {
+      run_id: runId,
+      stepDetail,
+      section: progress.section,
+      index: progress.index,
+      total: progress.total,
+      phase: progress.phase,
+    },
+    'Progress updated'
+  );
 }
 
 /**

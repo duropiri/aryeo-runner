@@ -22,6 +22,8 @@ export const ErrorCodes = {
   UI_NOT_READY: 'UI_NOT_READY',           // UI not in expected state for action
   ACTION_FAILED: 'ACTION_FAILED',         // UI was idle, action attempted, but did not succeed
   VERIFICATION_FAILED: 'VERIFICATION_FAILED', // Post-action verification failed after UI idle
+  CHECKBOX_FAILED: 'CHECKBOX_FAILED',     // Failed to interact with checkbox
+  ASSET_ALREADY_EXISTS: 'ASSET_ALREADY_EXISTS', // Asset already exists in listing (idempotent skip)
 } as const;
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes];
@@ -35,6 +37,46 @@ export const RunStatus = {
 } as const;
 
 export type RunStatusType = (typeof RunStatus)[keyof typeof RunStatus];
+
+// ============================================================================
+// Progress Tracking Types
+// ============================================================================
+
+/**
+ * Import phase for progress tracking
+ */
+export type ImportPhase =
+  | 'modal_open'
+  | 'import_clicked'
+  | 'add_enabled'
+  | 'add_clicked'
+  | 'verify'
+  | 'preflight_check'
+  | 'skipped_exists';
+
+/**
+ * Section being processed
+ */
+export type ImportSection = 'floorplans' | 'rms' | '3d_content' | 'save' | 'deliver';
+
+/**
+ * Progress info for status updates
+ */
+export interface ImportProgress {
+  section: ImportSection;
+  index: number;
+  total: number;
+  phase: ImportPhase;
+  filename?: string;
+}
+
+/**
+ * Detailed step info for status updates
+ */
+export interface StepDetail {
+  current_step_detail: string;
+  progress?: ImportProgress;
+}
 
 // ============================================================================
 // Simple n8n Payload Schema (what n8n sends)
@@ -166,6 +208,9 @@ export interface RunState {
     screenshots: EvidenceScreenshot[];
   };
   current_step?: string;
+  // New: detailed progress tracking
+  current_step_detail?: string;
+  progress?: ImportProgress;
 }
 
 // Callback payload structure
@@ -197,6 +242,8 @@ export interface StatusResponse {
   started_at?: string;
   completed_at?: string;
   current_step?: string;
+  current_step_detail?: string;
+  progress?: ImportProgress;
   error?: DeliveryError;
   assets_found?: AssetCounts;
   actions?: ActionsPerformed;

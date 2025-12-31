@@ -1,11 +1,17 @@
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { chromium, type Browser, type BrowserContext, type Page, type Locator } from 'playwright';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { getConfig } from '../config.js';
 import { logger } from '../logger.js';
-import { addEvidenceScreenshot } from '../queue.js';
-import { ErrorCodes, type DeliveryError, type InternalManifest } from '../types.js';
+import { addEvidenceScreenshot, updateProgress } from '../queue.js';
+import { ErrorCodes, type DeliveryError, type InternalManifest, type ImportPhase, type ImportSection, type ImportProgress } from '../types.js';
+import {
+  deduplicateAssetUrls,
+  extractDecodedFilename,
+  extractUrlPathFragment,
+  type NormalizedAsset,
+} from '../utils/url-dedup.js';
 import {
   TEXT,
   TIMEOUTS,
@@ -15,8 +21,6 @@ import {
   getFromLinkOption,
   getImportUrlInput,
   getImportButton,
-  getSetTitlesCheckbox,
-  getSetTitlesLabel,
   getCommitFilesButton,
   getUploadModal,
   get3DContentModal,
@@ -35,13 +39,16 @@ import {
   has3DContentWithTitle,
   // State-driven imports
   getUploadUIState,
-  isUploadInProgress,
   waitForAddButtonEnabled,
-  waitForMediaSectionUpdate,
   waitForModalClose,
-  hasFileInMediaRow,
   formatUISnapshot,
-  type UploadUIState,
+  // Asset existence checks
+  preflightAssetExists,
+  waitForAssetExists,
+  dumpUploadModalHtml,
+  // Checkbox helper
+  findAndCheckSetTitlesCheckbox,
+  type AssetExistsResult,
 } from './selectors.js';
 
 // Retry configuration
@@ -167,31 +174,6 @@ async function captureBaselineCounts(
   log.info({ floorPlans, files, threeDContent }, 'Baseline counts captured');
 
   return { floorPlans, files, threeDContent };
-}
-
-/**
- * Waits for count to increment from baseline
- */
-async function waitForCountIncrement(
-  ctx: AutomationContext,
-  rowLabel: string,
-  baselineCount: number,
-  timeout: number = TIMEOUTS.POST_VERIFY
-): Promise<boolean> {
-  const log = logger.child({ run_id: ctx.runId, rowLabel, baselineCount });
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeout) {
-    const currentCount = await getMediaRowCount(ctx.page, rowLabel);
-    if (currentCount > baselineCount) {
-      log.info({ baselineCount, currentCount }, 'Count increment verified');
-      return true;
-    }
-    await delay(500);
-  }
-
-  log.warn({ baselineCount }, 'Count did not increment within timeout');
-  return false;
 }
 
 /**
@@ -325,45 +307,101 @@ async function waitForPageReady(
 }
 
 /**
+ * Updates progress status for a specific import phase
+ */
+async function reportProgress(
+  runId: string,
+  section: ImportSection,
+  index: number,
+  total: number,
+  phase: ImportPhase,
+  filename?: string
+): Promise<void> {
+  const stepDetail = `${section}:index=${index} phase=${phase}`;
+  const progress: ImportProgress = {
+    section,
+    index,
+    total,
+    phase,
+    filename,
+  };
+
+  await updateProgress(runId, stepDetail, progress);
+}
+
+/**
  * Options for the unified import helper
  */
 interface ImportViaUrlOptions {
   section: string;           // Row label (e.g., TEXT.FLOOR_PLANS or TEXT.FILES)
-  url: string;               // URL to import
-  baselineCount: number;     // Count before this import
-  expectedCountIncrease: number; // How much count should increase (usually 1)
+  sectionKey: ImportSection; // Section key for progress reporting
+  asset: NormalizedAsset;    // Normalized asset with URL and filename
   setTitlesFromFilenames: boolean; // Whether to check the checkbox (floor plans only)
   step: string;              // Step name for evidence
   index: number;             // Index in the batch (for logging)
+  total: number;             // Total items in batch
 }
 
 /**
  * Unified helper for importing a URL via "From link" flow and verifying attachment.
  *
- * TWO-PHASE APPROACH:
- * - Phase 1: Wait for Add button to become enabled (max 90s)
- * - Phase 2: After clicking Add, verify count increase with exponential backoff (max 90s)
- *
- * SUCCESS requires hard evidence: count increase OR filename visible in DOM.
+ * IDEMPOTENT: Checks preflightAssetExists BEFORE importing.
+ * ROBUST: Verifies by asset presence (not just count) with exponential backoff.
+ * SAFE: After retry, re-checks preflight to prevent duplicate add.
  */
 async function importViaUrlAndAttach(
   ctx: AutomationContext,
   options: ImportViaUrlOptions
-): Promise<{ success: true } | { success: false; error: DeliveryError }> {
-  const { section, url, baselineCount, expectedCountIncrease, setTitlesFromFilenames, step, index } = options;
-  const log = logger.child({ run_id: ctx.runId, step, section, index, url, baselineCount });
-  const expectedCountAfterImport = baselineCount + expectedCountIncrease;
+): Promise<{ success: true; skipped?: boolean } | { success: false; error: DeliveryError }> {
+  const { section, sectionKey, asset, setTitlesFromFilenames, step, index, total } = options;
+  const { originalUrl, decodedFilename } = asset;
+  const urlPathFragment = extractUrlPathFragment(originalUrl);
 
-  // Extract filename from URL for secondary verification
-  const urlFilename = extractFilenameFromUrl(url);
+  const log = logger.child({
+    run_id: ctx.runId,
+    step,
+    section,
+    index,
+    total,
+    filename: decodedFilename,
+    normalizedUrl: asset.normalizedUrl,
+  });
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      log.info({ attempt }, `Importing URL via "From link" for ${section}`);
+      // ═══════════════════════════════════════════════════════════════════════
+      // PREFLIGHT CHECK: Does this asset already exist?
+      // ═══════════════════════════════════════════════════════════════════════
+      await reportProgress(ctx.runId, sectionKey, index, total, 'preflight_check', decodedFilename);
+
+      const preflightResult = await preflightAssetExists(
+        ctx.page,
+        section,
+        decodedFilename,
+        urlPathFragment
+      );
+
+      if (preflightResult.exists) {
+        log.info({
+          preflightExists: true,
+          matchMethod: preflightResult.matchMethod,
+          matchedElement: preflightResult.matchedElement,
+          attempt,
+        }, 'Asset already exists in listing - SKIPPING import (idempotent)');
+
+        await reportProgress(ctx.runId, sectionKey, index, total, 'skipped_exists', decodedFilename);
+        return { success: true, skipped: true };
+      }
+
+      log.info({
+        attempt,
+        preflightExists: false,
+      }, `Importing URL via "From link" for ${section}`);
 
       // ═══════════════════════════════════════════════════════════════════════
       // PHASE 0: Open the import modal
       // ═══════════════════════════════════════════════════════════════════════
+      await reportProgress(ctx.runId, sectionKey, index, total, 'modal_open', decodedFilename);
 
       // Click Add button for this row
       const addButton = getAddButtonForRow(ctx.page, section);
@@ -380,15 +418,43 @@ async function importViaUrlAndAttach(
       // Fill the URL input
       const urlInput = getImportUrlInput(ctx.page);
       await urlInput.waitFor({ state: 'visible', timeout: 5000 });
-      await urlInput.fill(url);
+      await urlInput.fill(originalUrl);
       log.debug('Filled URL input');
 
-      // Handle "Set titles from filenames" checkbox if needed
+      // ═══════════════════════════════════════════════════════════════════════
+      // Handle "Set titles from filenames" checkbox (ROBUST FIX)
+      // ═══════════════════════════════════════════════════════════════════════
       if (setTitlesFromFilenames) {
-        await handleSetTitlesCheckbox(ctx, log);
+        const checkboxResult = await findAndCheckSetTitlesCheckbox(ctx.page);
+
+        if (!checkboxResult.success) {
+          log.error({
+            error: checkboxResult.error,
+            modalHtml: checkboxResult.modalHtml?.substring(0, 500), // Truncate for logging
+          }, 'FAILED to check "Set titles from filenames" checkbox');
+
+          // Take screenshot with modal HTML dump
+          await takeScreenshot(ctx, step, `checkbox_failed_${attempt}_${index}`);
+
+          // Write modal HTML to file for debugging
+          if (checkboxResult.modalHtml) {
+            const htmlPath = path.join(ctx.evidenceDir, `checkbox_modal_${attempt}_${index}.html`);
+            await fsp.writeFile(htmlPath, checkboxResult.modalHtml);
+            log.debug({ htmlPath }, 'Modal HTML dumped for debugging');
+          }
+
+          throw new Error(`Checkbox interaction failed: ${checkboxResult.error}`);
+        }
+
+        log.info({
+          method: checkboxResult.method,
+          isChecked: checkboxResult.isChecked,
+        }, '"Set titles from filenames" checkbox checked successfully');
       }
 
       // Click Import button to start server-side processing
+      await reportProgress(ctx.runId, sectionKey, index, total, 'import_clicked', decodedFilename);
+
       const importButton = getImportButton(ctx.page);
       await importButton.waitFor({ state: 'visible', timeout: 5000 });
       await importButton.click();
@@ -412,6 +478,7 @@ async function importViaUrlAndAttach(
         throw new Error(`Phase 1 failed: ${phase1Result.reason}`);
       }
 
+      await reportProgress(ctx.runId, sectionKey, index, total, 'add_enabled', decodedFilename);
       log.info({
         addButtonText: phase1Result.state.addButtonText,
         uiSnapshot: formatUISnapshot(phase1Result.state),
@@ -420,6 +487,8 @@ async function importViaUrlAndAttach(
       // ═══════════════════════════════════════════════════════════════════════
       // CLICK THE ADD BUTTON
       // ═══════════════════════════════════════════════════════════════════════
+      await reportProgress(ctx.runId, sectionKey, index, total, 'add_clicked', decodedFilename);
+
       const commitButton = getCommitFilesButton(ctx.page);
       log.info('Clicking Add button to attach file to listing...');
       await commitButton.click();
@@ -435,34 +504,59 @@ async function importViaUrlAndAttach(
       }
 
       // ═══════════════════════════════════════════════════════════════════════
-      // PHASE 2: Verify count increase with exponential backoff (max 90s)
+      // PHASE 2: Verify asset presence with exponential backoff (max 90s)
+      // This verifies by ASSET PRESENCE, not just count!
       // ═══════════════════════════════════════════════════════════════════════
-      log.info('Phase 2: Verifying attachment with count check (exponential backoff)...');
+      await reportProgress(ctx.runId, sectionKey, index, total, 'verify', decodedFilename);
+      log.info('Phase 2: Verifying asset presence (exponential backoff)...');
 
-      const verified = await verifyAttachmentWithBackoff(ctx, {
+      const verifyResult = await waitForAssetExists(
+        ctx.page,
         section,
-        baselineCount,
-        expectedCount: expectedCountAfterImport,
-        filename: urlFilename,
-        timeout: TIMEOUTS.COUNT_VERIFICATION,
-      });
+        decodedFilename,
+        urlPathFragment,
+        TIMEOUTS.COUNT_VERIFICATION
+      );
 
-      if (verified.success) {
+      if (verifyResult.exists) {
         log.info({
-          baselineCount,
-          newCount: verified.newCount,
-          method: verified.method,
-        }, 'Phase 2 complete: Attachment VERIFIED');
+          matchMethod: verifyResult.matchMethod,
+          matchedElement: verifyResult.matchedElement,
+        }, 'Phase 2 complete: Asset VERIFIED in listing');
         await takeScreenshot(ctx, step, `success_${index}`);
         return { success: true };
       }
 
-      // Verification failed
+      // ═══════════════════════════════════════════════════════════════════════
+      // VERIFICATION FALLBACK: Reload page and try again
+      // ═══════════════════════════════════════════════════════════════════════
+      log.warn('Asset not found after initial verification - attempting page reload');
+      await ctx.page.reload({ waitUntil: 'networkidle' });
+      await waitForLoadingComplete(ctx.page);
+
+      // Re-run verification for up to 30s more
+      const postReloadResult = await waitForAssetExists(
+        ctx.page,
+        section,
+        decodedFilename,
+        urlPathFragment,
+        TIMEOUTS.POST_RELOAD_VERIFY
+      );
+
+      if (postReloadResult.exists) {
+        log.info({
+          matchMethod: postReloadResult.matchMethod,
+          matchedElement: postReloadResult.matchedElement,
+        }, 'Asset found after page reload - VERIFIED');
+        await takeScreenshot(ctx, step, `success_after_reload_${index}`);
+        return { success: true };
+      }
+
+      // Verification failed even after reload
       log.error({
-        baselineCount,
-        newCount: verified.newCount,
-        expectedCount: expectedCountAfterImport,
-      }, 'Phase 2 failed: Count did not increase');
+        filename: decodedFilename,
+        urlPathFragment,
+      }, 'Phase 2 failed: Asset not visible even after page reload');
 
       // Check for error toast
       const errorToast = getErrorToast(ctx.page);
@@ -472,11 +566,16 @@ async function importViaUrlAndAttach(
       }
 
       await takeScreenshot(ctx, step, `phase2_failed_attempt_${attempt}_${index}`);
-      throw new Error(`Verification failed: ${section} count did not increase (baseline: ${baselineCount}, current: ${verified.newCount}, expected: ${expectedCountAfterImport})`);
+      throw new Error(`Verification failed: Asset "${decodedFilename}" not visible in ${section} after import`);
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      log.warn({ attempt, error: errorMessage }, `Import attempt ${attempt}/${MAX_RETRIES} failed for ${section}`);
+      log.warn({
+        attempt,
+        error: errorMessage,
+        filename: decodedFilename,
+        normalizedUrl: asset.normalizedUrl,
+      }, `Import attempt ${attempt}/${MAX_RETRIES} failed for ${section}`);
 
       // Capture UI state for diagnostics
       const uiState = await getUploadUIState(ctx.page);
@@ -499,63 +598,10 @@ async function importViaUrlAndAttach(
     success: false,
     error: {
       code: ErrorCodes.ACTION_FAILED,
-      message: `Failed to import URL for ${section} after ${MAX_RETRIES} retries: ${url}`,
+      message: `Failed to import URL for ${section} after ${MAX_RETRIES} retries: ${originalUrl}`,
       retryable: true,
     },
   };
-}
-
-/**
- * Verifies that an attachment was successful using count check with exponential backoff.
- * Also tries filename matching as a secondary verification method.
- */
-async function verifyAttachmentWithBackoff(
-  ctx: AutomationContext,
-  options: {
-    section: string;
-    baselineCount: number;
-    expectedCount: number;
-    filename: string | null;
-    timeout: number;
-  }
-): Promise<{ success: boolean; newCount: number; method: string }> {
-  const { section, baselineCount, expectedCount, filename, timeout } = options;
-  const log = logger.child({ run_id: ctx.runId, section, baselineCount, expectedCount });
-  const startTime = Date.now();
-  const backoffIntervals = TIMEOUTS.BACKOFF_INTERVALS;
-  let backoffIndex = 0;
-
-  while (Date.now() - startTime < timeout) {
-    // Check count
-    const currentCount = await getMediaRowCount(ctx.page, section);
-
-    if (currentCount >= expectedCount) {
-      return { success: true, newCount: currentCount, method: 'count_increase' };
-    }
-
-    // Try filename match as secondary verification
-    if (filename && currentCount > baselineCount) {
-      const filenameVisible = await hasFileInMediaRow(ctx.page, section, filename);
-      if (filenameVisible) {
-        log.warn({ filename }, 'Filename visible but count lower than expected - treating as success');
-        return { success: true, newCount: currentCount, method: 'filename_match' };
-      }
-    }
-
-    // Wait with exponential backoff
-    const waitTime = backoffIntervals[Math.min(backoffIndex, backoffIntervals.length - 1)] ?? 5000;
-    log.debug({ currentCount, expectedCount, waitTime }, 'Count not yet increased, waiting...');
-    await delay(waitTime);
-    backoffIndex++;
-  }
-
-  // Final check
-  const finalCount = await getMediaRowCount(ctx.page, section);
-  if (finalCount >= expectedCount) {
-    return { success: true, newCount: finalCount, method: 'count_increase' };
-  }
-
-  return { success: false, newCount: finalCount, method: 'none' };
 }
 
 /**
@@ -573,260 +619,207 @@ async function closeOpenModals(ctx: AutomationContext): Promise<void> {
 }
 
 /**
- * Handles the "Set titles from filenames" checkbox using role-based selectors.
- *
- * FIXED: Uses page.getByRole('checkbox') instead of targeting the label.
- * If the checkbox is not found or errors, logs a warning and continues.
- */
-async function handleSetTitlesCheckbox(
-  ctx: AutomationContext,
-  log: typeof logger
-): Promise<void> {
-  try {
-    // Try role-based selector first (recommended by Playwright)
-    const checkbox = getSetTitlesCheckbox(ctx.page);
-
-    // Check if the checkbox is visible
-    const isVisible = await checkbox.isVisible({ timeout: 3000 }).catch(() => false);
-
-    if (!isVisible) {
-      // Try clicking the label as fallback (some UIs hide the actual checkbox)
-      const label = getSetTitlesLabel(ctx.page);
-      const labelVisible = await label.isVisible({ timeout: 2000 }).catch(() => false);
-
-      if (labelVisible) {
-        log.debug('Checkbox not visible, but label found - clicking label');
-        await label.click();
-        return;
-      }
-
-      log.info('"Set titles from filenames" checkbox not found - proceeding without it');
-      return;
-    }
-
-    // Check if already checked
-    let isChecked = false;
-    try {
-      isChecked = await checkbox.isChecked();
-    } catch (checkErr) {
-      // isChecked() failed - this means it's not a checkbox element
-      // Try clicking instead
-      log.debug({ error: (checkErr as Error).message }, 'isChecked() failed - trying click instead');
-      await checkbox.click().catch(() => {});
-      return;
-    }
-
-    if (!isChecked) {
-      // Try to check it
-      try {
-        await checkbox.check();
-        log.debug('Checked "Set titles from filenames" checkbox');
-      } catch (checkErr) {
-        // check() failed - try click
-        log.debug({ error: (checkErr as Error).message }, 'check() failed - trying click instead');
-        await checkbox.click().catch(() => {});
-      }
-    } else {
-      log.debug('"Set titles from filenames" checkbox already checked');
-    }
-  } catch (err) {
-    log.info({ error: err instanceof Error ? err.message : String(err) },
-      'Error handling "Set titles from filenames" checkbox - proceeding without it');
-  }
-}
-
-// Legacy wrapper for backwards compatibility
-async function importFromLink(
-  ctx: AutomationContext,
-  rowLabel: string,
-  url: string,
-  checkSetTitlesFromFilenames: boolean,
-  step: string,
-  index: number,
-  baselineCount: number
-): Promise<{ success: true } | { success: false; error: DeliveryError }> {
-  return importViaUrlAndAttach(ctx, {
-    section: rowLabel,
-    url,
-    baselineCount: baselineCount + index, // Adjust for items already imported in this batch
-    expectedCountIncrease: 1,
-    setTitlesFromFilenames: checkSetTitlesFromFilenames,
-    step,
-    index,
-  });
-}
-
-/**
- * Extracts filename from a URL for verification purposes
- */
-function extractFilenameFromUrl(url: string): string | null {
-  try {
-    const urlObj = new URL(url);
-    const pathname = urlObj.pathname;
-    const filename = pathname.split('/').pop();
-    if (filename && filename.length > 0) {
-      // Remove common URL-encoded characters
-      return decodeURIComponent(filename).replace(/\+/g, ' ');
-    }
-  } catch {
-    // Invalid URL
-  }
-  return null;
-}
-
-/**
  * Result of importing multiple URLs
  */
 interface BatchImportResult {
   success: boolean;
   error?: DeliveryError;
   successCount: number;
+  skippedCount: number;
   totalCount: number;
   allVerified: boolean;
 }
 
 /**
  * Imports all floor plan URLs with proper verification.
- * Returns allVerified=true ONLY if ALL items were attached and verified.
+ * Pre-deduplicates URLs before importing.
+ * Returns allVerified=true ONLY if ALL non-skipped items were attached and verified.
  */
 async function importFloorplans(
   ctx: AutomationContext,
-  urls: string[],
-  baselineCount: number
+  urls: string[]
 ): Promise<BatchImportResult> {
-  const log = logger.child({ run_id: ctx.runId, count: urls.length, baselineCount });
+  const log = logger.child({ run_id: ctx.runId, section: 'floorplans' });
 
   if (urls.length === 0) {
     log.info('No floor plan URLs to import, skipping');
-    return { success: true, successCount: 0, totalCount: 0, allVerified: true };
+    return { success: true, successCount: 0, skippedCount: 0, totalCount: 0, allVerified: true };
   }
 
-  log.info({ urls }, 'Starting floor plan imports');
-  let successCount = 0;
+  // ═══════════════════════════════════════════════════════════════════════
+  // PRE-DEDUPE: Normalize and deduplicate URLs BEFORE Playwright
+  // ═══════════════════════════════════════════════════════════════════════
+  const dedupeResult = deduplicateAssetUrls(urls, ctx.runId, 'floorplan');
 
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i];
-    if (!url) continue;
+  log.info({
+    originalCount: urls.length,
+    deduplicatedCount: dedupeResult.urls.length,
+    duplicatesRemoved: dedupeResult.duplicatesRemoved,
+  }, 'Floor plan URLs deduplicated');
+
+  if (dedupeResult.assets.length === 0) {
+    log.info('All floor plan URLs were duplicates, nothing to import');
+    return { success: true, successCount: 0, skippedCount: urls.length, totalCount: urls.length, allVerified: true };
+  }
+
+  log.info({ urls: dedupeResult.urls }, 'Starting floor plan imports');
+
+  let successCount = 0;
+  let skippedCount = 0;
+  const total = dedupeResult.assets.length;
+
+  for (let i = 0; i < dedupeResult.assets.length; i++) {
+    const asset = dedupeResult.assets[i];
+    if (!asset) continue;
 
     const result = await importViaUrlAndAttach(ctx, {
       section: TEXT.FLOOR_PLANS,
-      url,
-      baselineCount: baselineCount + successCount, // Use actual success count, not i
-      expectedCountIncrease: 1,
+      sectionKey: 'floorplans',
+      asset,
       setTitlesFromFilenames: true,
       step: Steps.IMPORT_FLOORPLAN,
       index: i,
+      total,
     });
 
     if (!result.success) {
-      log.error({ url, index: i }, 'Floor plan import failed');
+      log.error({ url: asset.originalUrl, index: i }, 'Floor plan import failed');
       return {
         success: false,
         error: result.error,
         successCount,
-        totalCount: urls.length,
+        skippedCount,
+        totalCount: total,
         allVerified: false,
       };
     }
 
-    successCount++;
-    log.info({ successCount, totalCount: urls.length }, 'Floor plan imported successfully');
+    if (result.skipped) {
+      skippedCount++;
+      log.info({ filename: asset.decodedFilename, index: i }, 'Floor plan skipped (already exists)');
+    } else {
+      successCount++;
+      log.info({ successCount, skippedCount, total }, 'Floor plan imported successfully');
+    }
 
     // Small delay between imports
-    if (i < urls.length - 1) {
+    if (i < dedupeResult.assets.length - 1) {
       await delay(1000);
     }
   }
 
-  // Final verification: check total count matches expected
-  const finalCount = await getMediaRowCount(ctx.page, TEXT.FLOOR_PLANS);
-  const expectedCount = baselineCount + urls.length;
-  const allVerified = finalCount >= expectedCount;
+  // All items processed successfully
+  const allVerified = successCount + skippedCount === total;
 
-  if (allVerified) {
-    log.info({ baselineCount, finalCount, expectedCount }, 'All floor plans imported and VERIFIED');
-  } else {
-    log.warn({ baselineCount, finalCount, expectedCount, successCount },
-      'Final count verification failed - some items may not have attached');
-  }
+  log.info({
+    successCount,
+    skippedCount,
+    total,
+    allVerified,
+  }, 'All floor plans processed');
 
   return {
     success: true,
     successCount,
-    totalCount: urls.length,
+    skippedCount,
+    totalCount: total,
     allVerified,
   };
 }
 
 /**
  * Imports all RMS URLs (into the Files row) with proper verification.
- * Returns allVerified=true ONLY if ALL items were attached and verified.
+ * Pre-deduplicates URLs before importing.
+ * Returns allVerified=true ONLY if ALL non-skipped items were attached and verified.
  */
 async function importRmsFiles(
   ctx: AutomationContext,
-  urls: string[],
-  baselineCount: number
+  urls: string[]
 ): Promise<BatchImportResult> {
-  const log = logger.child({ run_id: ctx.runId, count: urls.length, baselineCount });
+  const log = logger.child({ run_id: ctx.runId, section: 'rms' });
 
   if (urls.length === 0) {
     log.info('No RMS URLs to import, skipping');
-    return { success: true, successCount: 0, totalCount: 0, allVerified: true };
+    return { success: true, successCount: 0, skippedCount: 0, totalCount: 0, allVerified: true };
   }
 
-  log.info({ urls }, 'Starting RMS file imports');
-  let successCount = 0;
+  // ═══════════════════════════════════════════════════════════════════════
+  // PRE-DEDUPE: Normalize and deduplicate URLs BEFORE Playwright
+  // ═══════════════════════════════════════════════════════════════════════
+  const dedupeResult = deduplicateAssetUrls(urls, ctx.runId, 'rms');
 
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i];
-    if (!url) continue;
+  log.info({
+    originalCount: urls.length,
+    deduplicatedCount: dedupeResult.urls.length,
+    duplicatesRemoved: dedupeResult.duplicatesRemoved,
+  }, 'RMS URLs deduplicated');
+
+  if (dedupeResult.assets.length === 0) {
+    log.info('All RMS URLs were duplicates, nothing to import');
+    return { success: true, successCount: 0, skippedCount: urls.length, totalCount: urls.length, allVerified: true };
+  }
+
+  log.info({ urls: dedupeResult.urls }, 'Starting RMS file imports');
+
+  let successCount = 0;
+  let skippedCount = 0;
+  const total = dedupeResult.assets.length;
+
+  for (let i = 0; i < dedupeResult.assets.length; i++) {
+    const asset = dedupeResult.assets[i];
+    if (!asset) continue;
 
     const result = await importViaUrlAndAttach(ctx, {
       section: TEXT.FILES,
-      url,
-      baselineCount: baselineCount + successCount,
-      expectedCountIncrease: 1,
+      sectionKey: 'rms',
+      asset,
       setTitlesFromFilenames: false,
       step: Steps.IMPORT_RMS,
       index: i,
+      total,
     });
 
     if (!result.success) {
-      log.error({ url, index: i }, 'RMS file import failed');
+      log.error({ url: asset.originalUrl, index: i }, 'RMS file import failed');
       return {
         success: false,
         error: result.error,
         successCount,
-        totalCount: urls.length,
+        skippedCount,
+        totalCount: total,
         allVerified: false,
       };
     }
 
-    successCount++;
-    log.info({ successCount, totalCount: urls.length }, 'RMS file imported successfully');
+    if (result.skipped) {
+      skippedCount++;
+      log.info({ filename: asset.decodedFilename, index: i }, 'RMS file skipped (already exists)');
+    } else {
+      successCount++;
+      log.info({ successCount, skippedCount, total }, 'RMS file imported successfully');
+    }
 
     // Small delay between imports
-    if (i < urls.length - 1) {
+    if (i < dedupeResult.assets.length - 1) {
       await delay(1000);
     }
   }
 
-  // Final verification
-  const finalCount = await getMediaRowCount(ctx.page, TEXT.FILES);
-  const expectedCount = baselineCount + urls.length;
-  const allVerified = finalCount >= expectedCount;
+  // All items processed successfully
+  const allVerified = successCount + skippedCount === total;
 
-  if (allVerified) {
-    log.info({ baselineCount, finalCount, expectedCount }, 'All RMS files imported and VERIFIED');
-  } else {
-    log.warn({ baselineCount, finalCount, expectedCount, successCount },
-      'Final count verification failed - some items may not have attached');
-  }
+  log.info({
+    successCount,
+    skippedCount,
+    total,
+    allVerified,
+  }, 'All RMS files processed');
 
   return {
     success: true,
     successCount,
-    totalCount: urls.length,
+    skippedCount,
+    totalCount: total,
     allVerified,
   };
 }
@@ -867,6 +860,9 @@ async function add3DContent(
     return { success: true, verified: true }; // Already exists = verified
   }
 
+  // Report progress
+  await reportProgress(ctx.runId, '3d_content', 0, 1, 'preflight_check');
+
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       log.info({ attempt }, 'Adding 3D Content');
@@ -874,6 +870,8 @@ async function add3DContent(
       // ═══════════════════════════════════════════════════════════════════════
       // PHASE 0: Open the 3D content modal
       // ═══════════════════════════════════════════════════════════════════════
+      await reportProgress(ctx.runId, '3d_content', 0, 1, 'modal_open');
+
       const addButton = getAddButtonForRow(ctx.page, TEXT.THREE_D_CONTENT);
       await addButton.waitFor({ state: 'visible', timeout: TIMEOUTS.ELEMENT_VISIBLE });
       await addButton.click();
@@ -916,6 +914,8 @@ async function add3DContent(
       // ═══════════════════════════════════════════════════════════════════════
       // PHASE 2: Wait for Add Content button to be enabled and click it
       // ═══════════════════════════════════════════════════════════════════════
+      await reportProgress(ctx.runId, '3d_content', 0, 1, 'add_enabled');
+
       const addContentButton = getAddContentButton(ctx.page);
       await addContentButton.waitFor({ state: 'visible', timeout: 5000 });
 
@@ -930,6 +930,7 @@ async function add3DContent(
         { timeout: TIMEOUTS.ADD_BUTTON_ENABLED }
       );
 
+      await reportProgress(ctx.runId, '3d_content', 0, 1, 'add_clicked');
       log.info('Add Content button is enabled - clicking...');
       await addContentButton.click();
 
@@ -945,6 +946,7 @@ async function add3DContent(
       // ═══════════════════════════════════════════════════════════════════════
       // PHASE 3: Verify content was added (exponential backoff)
       // ═══════════════════════════════════════════════════════════════════════
+      await reportProgress(ctx.runId, '3d_content', 0, 1, 'verify');
       log.info('Phase 3: Verifying 3D Content was added...');
 
       const verified = await verify3DContentWithBackoff(ctx, {
@@ -1235,27 +1237,6 @@ async function validateFormValues(
 }
 
 /**
- * Waits for 3D content with a specific title to appear in the media list
- */
-async function waitFor3DContentWithTitle(
-  page: Page,
-  title: string,
-  timeout: number
-): Promise<boolean> {
-  const startTime = Date.now();
-
-  while (Date.now() - startTime < timeout) {
-    const exists = await has3DContentWithTitle(page, title);
-    if (exists) {
-      return true;
-    }
-    await page.waitForTimeout(TIMEOUTS.STATE_POLL_INTERVAL);
-  }
-
-  return false;
-}
-
-/**
  * Saves the listing changes
  *
  * STATE-DRIVEN: Waits for save operation to complete based on UI state,
@@ -1265,6 +1246,8 @@ async function saveListing(
   ctx: AutomationContext
 ): Promise<{ success: true } | { success: false; error: DeliveryError }> {
   const log = logger.child({ run_id: ctx.runId, step: Steps.SAVE_LISTING });
+
+  await reportProgress(ctx.runId, 'save', 0, 1, 'modal_open');
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -1376,6 +1359,8 @@ async function deliverListing(
 ): Promise<{ success: true } | { success: false; error: DeliveryError }> {
   const log = logger.child({ run_id: ctx.runId, step: Steps.DELIVER_LISTING });
 
+  await reportProgress(ctx.runId, 'deliver', 0, 1, 'modal_open');
+
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       log.info({ attempt }, 'Delivering listing');
@@ -1413,6 +1398,7 @@ async function deliverListing(
         );
       }
 
+      await reportProgress(ctx.runId, 'deliver', 0, 1, 'add_clicked');
       log.info('Clicking Deliver confirm button');
       await confirmButton.click();
 
@@ -1420,6 +1406,7 @@ async function deliverListing(
       await waitForLoadingComplete(ctx.page, TIMEOUTS.MODAL_CLOSE);
 
       // Poll for success or error state
+      await reportProgress(ctx.runId, 'deliver', 0, 1, 'verify');
       const deliverResult = await waitForSaveResult(ctx.page, 15000);
 
       if (deliverResult.error) {
@@ -1557,12 +1544,8 @@ export async function runDeliveryAutomation(
     const baselineCounts = await captureBaselineCounts(ctx);
     log.info({ baselineCounts }, 'Captured baseline counts');
 
-    // Step 3: Import floor plans with verification
-    const floorplanResult = await importFloorplans(
-      ctx,
-      manifest.sources.floorplan_urls,
-      baselineCounts.floorPlans
-    );
+    // Step 3: Import floor plans with verification (includes pre-dedup)
+    const floorplanResult = await importFloorplans(ctx, manifest.sources.floorplan_urls);
     if (!floorplanResult.success) {
       return { success: false, error: floorplanResult.error!, actions };
     }
@@ -1571,16 +1554,13 @@ export async function runDeliveryAutomation(
     if (floorplanResult.totalCount > 0 && !floorplanResult.allVerified) {
       log.warn({
         successCount: floorplanResult.successCount,
+        skippedCount: floorplanResult.skippedCount,
         totalCount: floorplanResult.totalCount,
       }, 'Floor plans: not all items verified - imported_floorplans set to false');
     }
 
-    // Step 4: Import RMS files with verification
-    const rmsResult = await importRmsFiles(
-      ctx,
-      manifest.sources.rms_urls,
-      baselineCounts.files
-    );
+    // Step 4: Import RMS files with verification (includes pre-dedup)
+    const rmsResult = await importRmsFiles(ctx, manifest.sources.rms_urls);
     if (!rmsResult.success) {
       return { success: false, error: rmsResult.error!, actions };
     }
@@ -1589,6 +1569,7 @@ export async function runDeliveryAutomation(
     if (rmsResult.totalCount > 0 && !rmsResult.allVerified) {
       log.warn({
         successCount: rmsResult.successCount,
+        skippedCount: rmsResult.skippedCount,
         totalCount: rmsResult.totalCount,
       }, 'RMS files: not all items verified - imported_rms set to false');
     }
