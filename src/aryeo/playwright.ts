@@ -16,9 +16,9 @@ import {
   getImportUrlInput,
   getImportButton,
   getSetTitlesCheckbox,
+  getSetTitlesLabel,
   getCommitFilesButton,
   getUploadModal,
-  getStagedFilePreview,
   get3DContentModal,
   getContentTitleInput,
   getContentLinkInput,
@@ -36,11 +36,11 @@ import {
   // State-driven imports
   getUploadUIState,
   isUploadInProgress,
-  isUIReadyForCommit,
-  waitForUploadReadyState,
+  waitForAddButtonEnabled,
   waitForMediaSectionUpdate,
   waitForModalClose,
   hasFileInMediaRow,
+  formatUISnapshot,
   type UploadUIState,
 } from './selectors.js';
 
@@ -325,145 +325,144 @@ async function waitForPageReady(
 }
 
 /**
- * Imports a single URL via the "From link" flow for Floor Plans or Files.
- *
- * STATE-DRIVEN APPROACH:
- * - No fixed delays or blind retries
- * - All waits are based on observable UI state
- * - Only declares failure when UI is idle and expected state did not occur
+ * Options for the unified import helper
  */
-async function importFromLink(
-  ctx: AutomationContext,
-  rowLabel: string,
-  url: string,
-  checkSetTitlesFromFilenames: boolean,
-  step: string,
-  index: number,
-  baselineCount: number
-): Promise<{ success: true } | { success: false; error: DeliveryError }> {
-  const log = logger.child({ run_id: ctx.runId, step, rowLabel, index, url, baselineCount });
-  const expectedCountAfterImport = baselineCount + index + 1;
+interface ImportViaUrlOptions {
+  section: string;           // Row label (e.g., TEXT.FLOOR_PLANS or TEXT.FILES)
+  url: string;               // URL to import
+  baselineCount: number;     // Count before this import
+  expectedCountIncrease: number; // How much count should increase (usually 1)
+  setTitlesFromFilenames: boolean; // Whether to check the checkbox (floor plans only)
+  step: string;              // Step name for evidence
+  index: number;             // Index in the batch (for logging)
+}
 
-  // Extract filename from URL for verification
+/**
+ * Unified helper for importing a URL via "From link" flow and verifying attachment.
+ *
+ * TWO-PHASE APPROACH:
+ * - Phase 1: Wait for Add button to become enabled (max 90s)
+ * - Phase 2: After clicking Add, verify count increase with exponential backoff (max 90s)
+ *
+ * SUCCESS requires hard evidence: count increase OR filename visible in DOM.
+ */
+async function importViaUrlAndAttach(
+  ctx: AutomationContext,
+  options: ImportViaUrlOptions
+): Promise<{ success: true } | { success: false; error: DeliveryError }> {
+  const { section, url, baselineCount, expectedCountIncrease, setTitlesFromFilenames, step, index } = options;
+  const log = logger.child({ run_id: ctx.runId, step, section, index, url, baselineCount });
+  const expectedCountAfterImport = baselineCount + expectedCountIncrease;
+
+  // Extract filename from URL for secondary verification
   const urlFilename = extractFilenameFromUrl(url);
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      log.info({ attempt }, `Importing URL via "From link" for ${rowLabel}`);
+      log.info({ attempt }, `Importing URL via "From link" for ${section}`);
 
-      // STEP 1: Click Add button for this row
-      const addButton = getAddButtonForRow(ctx.page, rowLabel);
+      // ═══════════════════════════════════════════════════════════════════════
+      // PHASE 0: Open the import modal
+      // ═══════════════════════════════════════════════════════════════════════
+
+      // Click Add button for this row
+      const addButton = getAddButtonForRow(ctx.page, section);
       await addButton.waitFor({ state: 'visible', timeout: TIMEOUTS.ELEMENT_VISIBLE });
       await addButton.click();
       log.debug('Clicked Add button');
 
-      // STEP 2: Wait for and click "From link" option
+      // Wait for and click "From link" option
       const fromLinkOption = getFromLinkOption(ctx.page);
       await fromLinkOption.waitFor({ state: 'visible', timeout: 5000 });
       await fromLinkOption.click();
       log.debug('Clicked "From link" option');
 
-      // STEP 3: Fill the URL input
+      // Fill the URL input
       const urlInput = getImportUrlInput(ctx.page);
       await urlInput.waitFor({ state: 'visible', timeout: 5000 });
       await urlInput.fill(url);
       log.debug('Filled URL input');
 
-      // STEP 4: Handle "Set titles from filenames" checkbox with ASSERTION
-      if (checkSetTitlesFromFilenames) {
+      // Handle "Set titles from filenames" checkbox if needed
+      if (setTitlesFromFilenames) {
         await handleSetTitlesCheckbox(ctx, log);
       }
 
-      // STEP 5: Click Import button to START STAGING
+      // Click Import button to start server-side processing
       const importButton = getImportButton(ctx.page);
       await importButton.waitFor({ state: 'visible', timeout: 5000 });
       await importButton.click();
-      log.info('Clicked Import button - staging started');
+      log.info('Clicked Import button - server-side processing started');
 
-      // STEP 6: STATE-DRIVEN WAIT for upload to complete
-      // This polls the UI state until ALL conditions are met:
-      // - Progress bar gone or at 100%
-      // - File row shows real filename (not skeleton)
-      // - Add Files button is enabled
-      // - No loading spinner in modal
-      log.info('Waiting for upload to complete (state-driven)...');
+      // ═══════════════════════════════════════════════════════════════════════
+      // PHASE 1: Wait for Add button to become enabled (max 90s)
+      // ═══════════════════════════════════════════════════════════════════════
+      log.info('Phase 1: Waiting for Add button to become enabled...');
 
-      const uploadResult = await waitForUploadReadyState(ctx.page, TIMEOUTS.UPLOAD_PROGRESS_COMPLETE);
+      const phase1Result = await waitForAddButtonEnabled(ctx.page, TIMEOUTS.ADD_BUTTON_ENABLED);
 
-      if (!uploadResult.ready) {
-        // Log detailed state for debugging
-        log.warn({
-          reason: uploadResult.reason,
-          state: uploadResult.state,
-        }, 'Upload did not reach ready state');
+      if (!phase1Result.ready) {
+        // Dump UI snapshot for diagnostics
+        log.error({
+          reason: phase1Result.reason,
+          uiSnapshot: formatUISnapshot(phase1Result.state),
+        }, 'Phase 1 failed: Add button did not become enabled');
 
-        // Check if it's still in progress (not a true failure yet)
-        if (isUploadInProgress(uploadResult.state)) {
-          // This is UPLOAD_PENDING, not a failure - but we've hit our timeout
-          throw new Error(`Upload timeout: ${uploadResult.reason}`);
-        }
-
-        // Check for error in the UI
-        if (uploadResult.state.hasErrorMessage) {
-          throw new Error(`Upload failed: ${uploadResult.state.errorMessage || 'Unknown error'}`);
-        }
-
-        throw new Error(`UI not ready for commit: ${uploadResult.reason}`);
+        await takeScreenshot(ctx, step, `phase1_failed_attempt_${attempt}_${index}`);
+        throw new Error(`Phase 1 failed: ${phase1Result.reason}`);
       }
 
       log.info({
-        progressPercent: uploadResult.state.progressPercent,
-        hasRealFilename: uploadResult.state.hasRealFilename,
-        buttonEnabled: uploadResult.state.isAddFilesButtonEnabled,
-      }, 'Upload complete - UI ready for commit');
+        addButtonText: phase1Result.state.addButtonText,
+        uiSnapshot: formatUISnapshot(phase1Result.state),
+      }, 'Phase 1 complete: Add button is enabled');
 
-      // STEP 7: CLICK THE COMMIT BUTTON (Add Files)
+      // ═══════════════════════════════════════════════════════════════════════
+      // CLICK THE ADD BUTTON
+      // ═══════════════════════════════════════════════════════════════════════
       const commitButton = getCommitFilesButton(ctx.page);
-      log.info('Clicking commit button to add file to listing...');
+      log.info('Clicking Add button to attach file to listing...');
       await commitButton.click();
-      log.debug('Clicked commit button');
+      log.debug('Clicked Add button');
 
-      // STEP 8: Wait for modal to close (state-driven)
+      // Wait for modal to close
       log.info('Waiting for modal to close...');
       const modalClosed = await waitForModalClose(ctx.page, TIMEOUTS.MODAL_CLOSE);
-
       if (!modalClosed) {
-        log.warn('Modal did not close within timeout - checking if upload succeeded anyway');
+        log.warn('Modal did not close within timeout - continuing to verification');
       } else {
         log.debug('Modal closed successfully');
       }
 
-      // STEP 9: Wait for media section to re-render and verify
-      log.info('Waiting for media section to update...');
-      const mediaUpdate = await waitForMediaSectionUpdate(
-        ctx.page,
-        rowLabel,
-        baselineCount + index, // Expected count before this import
-        TIMEOUTS.MEDIA_SECTION_RERENDER
-      );
+      // ═══════════════════════════════════════════════════════════════════════
+      // PHASE 2: Verify count increase with exponential backoff (max 90s)
+      // ═══════════════════════════════════════════════════════════════════════
+      log.info('Phase 2: Verifying attachment with count check (exponential backoff)...');
 
-      // STEP 10: VERIFY the file was actually added
-      log.info({ currentCount: mediaUpdate.newCount, expectedCount: expectedCountAfterImport }, 'Verifying import...');
+      const verified = await verifyAttachmentWithBackoff(ctx, {
+        section,
+        baselineCount,
+        expectedCount: expectedCountAfterImport,
+        filename: urlFilename,
+        timeout: TIMEOUTS.COUNT_VERIFICATION,
+      });
 
-      if (mediaUpdate.updated && mediaUpdate.newCount >= expectedCountAfterImport) {
-        log.info({ baselineCount, newCount: mediaUpdate.newCount }, 'Post-condition VERIFIED: count increased');
+      if (verified.success) {
+        log.info({
+          baselineCount,
+          newCount: verified.newCount,
+          method: verified.method,
+        }, 'Phase 2 complete: Attachment VERIFIED');
         await takeScreenshot(ctx, step, `success_${index}`);
         return { success: true };
       }
 
-      // Count didn't increase - try alternative verification: check if filename appears
-      if (urlFilename) {
-        const filenameVisible = await hasFileInMediaRow(ctx.page, rowLabel, urlFilename);
-        if (filenameVisible) {
-          log.warn({
-            baselineCount,
-            currentCount: mediaUpdate.newCount,
-            filename: urlFilename,
-          }, 'Filename visible but count did not change - treating as success');
-          await takeScreenshot(ctx, step, `success_filename_visible_${index}`);
-          return { success: true };
-        }
-      }
+      // Verification failed
+      log.error({
+        baselineCount,
+        newCount: verified.newCount,
+        expectedCount: expectedCountAfterImport,
+      }, 'Phase 2 failed: Count did not increase');
 
       // Check for error toast
       const errorToast = getErrorToast(ctx.page);
@@ -472,38 +471,24 @@ async function importFromLink(
         throw new Error(`Import failed with error: ${errorText}`);
       }
 
-      // Verification failed but UI is idle - this is ACTION_FAILED
-      await takeScreenshot(ctx, step, `verification_failed_${attempt}_${index}`);
-      throw new Error(`Verification failed: ${rowLabel} count did not increase (baseline: ${baselineCount}, current: ${mediaUpdate.newCount}, expected: ${expectedCountAfterImport})`);
+      await takeScreenshot(ctx, step, `phase2_failed_attempt_${attempt}_${index}`);
+      throw new Error(`Verification failed: ${section} count did not increase (baseline: ${baselineCount}, current: ${verified.newCount}, expected: ${expectedCountAfterImport})`);
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      log.warn({ attempt, error: errorMessage }, `Import attempt failed for ${rowLabel}`);
+      log.warn({ attempt, error: errorMessage }, `Import attempt ${attempt}/${MAX_RETRIES} failed for ${section}`);
 
-      // Only take screenshot if UI is idle (not during loading states)
-      const currentState = await getUploadUIState(ctx.page);
-      if (!isUploadInProgress(currentState)) {
-        await takeScreenshot(ctx, step, `error_attempt_${attempt}_${index}`);
-      }
+      // Capture UI state for diagnostics
+      const uiState = await getUploadUIState(ctx.page);
+      log.debug({ uiSnapshot: formatUISnapshot(uiState) }, 'UI state at failure');
+
+      // Take screenshot on failure (include attempt number)
+      await takeScreenshot(ctx, step, `error_attempt_${attempt}_${index}`);
 
       // Close any open modals before retry
-      try {
-        await ctx.page.keyboard.press('Escape');
-        await ctx.page.waitForTimeout(300);
-        await ctx.page.keyboard.press('Escape');
-        await ctx.page.waitForTimeout(300);
-      } catch {
-        // Ignore
-      }
+      await closeOpenModals(ctx);
 
       if (attempt < MAX_RETRIES) {
-        // Only retry if UI is in a stable state (not still processing)
-        const stateBeforeRetry = await getUploadUIState(ctx.page);
-        if (isUploadInProgress(stateBeforeRetry)) {
-          log.info('Upload still in progress - waiting before retry...');
-          // Wait for it to complete or fail before retrying
-          await waitForUploadReadyState(ctx.page, TIMEOUTS.UPLOAD_PROGRESS_COMPLETE);
-        }
         log.info(`Retrying import in ${RETRY_DELAY_MS}ms...`);
         await delay(RETRY_DELAY_MS);
       }
@@ -514,50 +499,132 @@ async function importFromLink(
     success: false,
     error: {
       code: ErrorCodes.ACTION_FAILED,
-      message: `Failed to import URL for ${rowLabel} after ${MAX_RETRIES} retries (UI was idle, action did not succeed): ${url}`,
+      message: `Failed to import URL for ${section} after ${MAX_RETRIES} retries: ${url}`,
       retryable: true,
     },
   };
 }
 
 /**
- * Handles the "Set titles from filenames" checkbox with proper assertion
+ * Verifies that an attachment was successful using count check with exponential backoff.
+ * Also tries filename matching as a secondary verification method.
+ */
+async function verifyAttachmentWithBackoff(
+  ctx: AutomationContext,
+  options: {
+    section: string;
+    baselineCount: number;
+    expectedCount: number;
+    filename: string | null;
+    timeout: number;
+  }
+): Promise<{ success: boolean; newCount: number; method: string }> {
+  const { section, baselineCount, expectedCount, filename, timeout } = options;
+  const log = logger.child({ run_id: ctx.runId, section, baselineCount, expectedCount });
+  const startTime = Date.now();
+  const backoffIntervals = TIMEOUTS.BACKOFF_INTERVALS;
+  let backoffIndex = 0;
+
+  while (Date.now() - startTime < timeout) {
+    // Check count
+    const currentCount = await getMediaRowCount(ctx.page, section);
+
+    if (currentCount >= expectedCount) {
+      return { success: true, newCount: currentCount, method: 'count_increase' };
+    }
+
+    // Try filename match as secondary verification
+    if (filename && currentCount > baselineCount) {
+      const filenameVisible = await hasFileInMediaRow(ctx.page, section, filename);
+      if (filenameVisible) {
+        log.warn({ filename }, 'Filename visible but count lower than expected - treating as success');
+        return { success: true, newCount: currentCount, method: 'filename_match' };
+      }
+    }
+
+    // Wait with exponential backoff
+    const waitTime = backoffIntervals[Math.min(backoffIndex, backoffIntervals.length - 1)] ?? 5000;
+    log.debug({ currentCount, expectedCount, waitTime }, 'Count not yet increased, waiting...');
+    await delay(waitTime);
+    backoffIndex++;
+  }
+
+  // Final check
+  const finalCount = await getMediaRowCount(ctx.page, section);
+  if (finalCount >= expectedCount) {
+    return { success: true, newCount: finalCount, method: 'count_increase' };
+  }
+
+  return { success: false, newCount: finalCount, method: 'none' };
+}
+
+/**
+ * Closes any open modals by pressing Escape
+ */
+async function closeOpenModals(ctx: AutomationContext): Promise<void> {
+  try {
+    await ctx.page.keyboard.press('Escape');
+    await ctx.page.waitForTimeout(300);
+    await ctx.page.keyboard.press('Escape');
+    await ctx.page.waitForTimeout(300);
+  } catch {
+    // Ignore
+  }
+}
+
+/**
+ * Handles the "Set titles from filenames" checkbox using role-based selectors.
+ *
+ * FIXED: Uses page.getByRole('checkbox') instead of targeting the label.
+ * If the checkbox is not found or errors, logs a warning and continues.
  */
 async function handleSetTitlesCheckbox(
   ctx: AutomationContext,
   log: typeof logger
 ): Promise<void> {
-  const checkbox = getSetTitlesCheckbox(ctx.page);
-
   try {
-    // Wait for checkbox to be visible
+    // Try role-based selector first (recommended by Playwright)
+    const checkbox = getSetTitlesCheckbox(ctx.page);
+
+    // Check if the checkbox is visible
     const isVisible = await checkbox.isVisible({ timeout: 3000 }).catch(() => false);
 
     if (!isVisible) {
+      // Try clicking the label as fallback (some UIs hide the actual checkbox)
+      const label = getSetTitlesLabel(ctx.page);
+      const labelVisible = await label.isVisible({ timeout: 2000 }).catch(() => false);
+
+      if (labelVisible) {
+        log.debug('Checkbox not visible, but label found - clicking label');
+        await label.click();
+        return;
+      }
+
       log.info('"Set titles from filenames" checkbox not found - proceeding without it');
       return;
     }
 
-    // Check current state
-    const isChecked = await checkbox.isChecked();
+    // Check if already checked
+    let isChecked = false;
+    try {
+      isChecked = await checkbox.isChecked();
+    } catch (checkErr) {
+      // isChecked() failed - this means it's not a checkbox element
+      // Try clicking instead
+      log.debug({ error: (checkErr as Error).message }, 'isChecked() failed - trying click instead');
+      await checkbox.click().catch(() => {});
+      return;
+    }
 
     if (!isChecked) {
-      await checkbox.check();
-      log.debug('Checked "Set titles from filenames" checkbox');
-
-      // ASSERTION: Verify it's now checked
-      const isNowChecked = await checkbox.isChecked();
-      if (!isNowChecked) {
-        log.warn('Checkbox check failed - attempting to click directly');
-        await checkbox.click();
-
-        // Re-verify
-        const finalState = await checkbox.isChecked();
-        if (finalState) {
-          log.debug('Checkbox checked via direct click');
-        } else {
-          log.warn('Could not check "Set titles from filenames" checkbox - proceeding anyway');
-        }
+      // Try to check it
+      try {
+        await checkbox.check();
+        log.debug('Checked "Set titles from filenames" checkbox');
+      } catch (checkErr) {
+        // check() failed - try click
+        log.debug({ error: (checkErr as Error).message }, 'check() failed - trying click instead');
+        await checkbox.click().catch(() => {});
       }
     } else {
       log.debug('"Set titles from filenames" checkbox already checked');
@@ -566,6 +633,27 @@ async function handleSetTitlesCheckbox(
     log.info({ error: err instanceof Error ? err.message : String(err) },
       'Error handling "Set titles from filenames" checkbox - proceeding without it');
   }
+}
+
+// Legacy wrapper for backwards compatibility
+async function importFromLink(
+  ctx: AutomationContext,
+  rowLabel: string,
+  url: string,
+  checkSetTitlesFromFilenames: boolean,
+  step: string,
+  index: number,
+  baselineCount: number
+): Promise<{ success: true } | { success: false; error: DeliveryError }> {
+  return importViaUrlAndAttach(ctx, {
+    section: rowLabel,
+    url,
+    baselineCount: baselineCount + index, // Adjust for items already imported in this batch
+    expectedCountIncrease: 1,
+    setTitlesFromFilenames: checkSetTitlesFromFilenames,
+    step,
+    index,
+  });
 }
 
 /**
@@ -587,39 +675,62 @@ function extractFilenameFromUrl(url: string): string | null {
 }
 
 /**
- * Imports all floor plan URLs with proper verification
+ * Result of importing multiple URLs
+ */
+interface BatchImportResult {
+  success: boolean;
+  error?: DeliveryError;
+  successCount: number;
+  totalCount: number;
+  allVerified: boolean;
+}
+
+/**
+ * Imports all floor plan URLs with proper verification.
+ * Returns allVerified=true ONLY if ALL items were attached and verified.
  */
 async function importFloorplans(
   ctx: AutomationContext,
   urls: string[],
   baselineCount: number
-): Promise<{ success: true } | { success: false; error: DeliveryError }> {
+): Promise<BatchImportResult> {
   const log = logger.child({ run_id: ctx.runId, count: urls.length, baselineCount });
 
   if (urls.length === 0) {
     log.info('No floor plan URLs to import, skipping');
-    return { success: true };
+    return { success: true, successCount: 0, totalCount: 0, allVerified: true };
   }
 
   log.info({ urls }, 'Starting floor plan imports');
+  let successCount = 0;
 
   for (let i = 0; i < urls.length; i++) {
     const url = urls[i];
     if (!url) continue;
 
-    const result = await importFromLink(
-      ctx,
-      TEXT.FLOOR_PLANS,
+    const result = await importViaUrlAndAttach(ctx, {
+      section: TEXT.FLOOR_PLANS,
       url,
-      true, // Check "Set titles from filenames" for floor plans
-      Steps.IMPORT_FLOORPLAN,
-      i,
-      baselineCount
-    );
+      baselineCount: baselineCount + successCount, // Use actual success count, not i
+      expectedCountIncrease: 1,
+      setTitlesFromFilenames: true,
+      step: Steps.IMPORT_FLOORPLAN,
+      index: i,
+    });
 
     if (!result.success) {
-      return result;
+      log.error({ url, index: i }, 'Floor plan import failed');
+      return {
+        success: false,
+        error: result.error,
+        successCount,
+        totalCount: urls.length,
+        allVerified: false,
+      };
     }
+
+    successCount++;
+    log.info({ successCount, totalCount: urls.length }, 'Floor plan imported successfully');
 
     // Small delay between imports
     if (i < urls.length - 1) {
@@ -630,50 +741,69 @@ async function importFloorplans(
   // Final verification: check total count matches expected
   const finalCount = await getMediaRowCount(ctx.page, TEXT.FLOOR_PLANS);
   const expectedCount = baselineCount + urls.length;
+  const allVerified = finalCount >= expectedCount;
 
-  if (finalCount >= expectedCount) {
+  if (allVerified) {
     log.info({ baselineCount, finalCount, expectedCount }, 'All floor plans imported and VERIFIED');
   } else {
-    log.warn({ baselineCount, finalCount, expectedCount }, 'Floor plan count lower than expected, but individual imports succeeded');
+    log.warn({ baselineCount, finalCount, expectedCount, successCount },
+      'Final count verification failed - some items may not have attached');
   }
 
-  return { success: true };
+  return {
+    success: true,
+    successCount,
+    totalCount: urls.length,
+    allVerified,
+  };
 }
 
 /**
- * Imports all RMS URLs (into the Files row) with proper verification
+ * Imports all RMS URLs (into the Files row) with proper verification.
+ * Returns allVerified=true ONLY if ALL items were attached and verified.
  */
 async function importRmsFiles(
   ctx: AutomationContext,
   urls: string[],
   baselineCount: number
-): Promise<{ success: true } | { success: false; error: DeliveryError }> {
+): Promise<BatchImportResult> {
   const log = logger.child({ run_id: ctx.runId, count: urls.length, baselineCount });
 
   if (urls.length === 0) {
     log.info('No RMS URLs to import, skipping');
-    return { success: true };
+    return { success: true, successCount: 0, totalCount: 0, allVerified: true };
   }
 
   log.info({ urls }, 'Starting RMS file imports');
+  let successCount = 0;
 
   for (let i = 0; i < urls.length; i++) {
     const url = urls[i];
     if (!url) continue;
 
-    const result = await importFromLink(
-      ctx,
-      TEXT.FILES,
+    const result = await importViaUrlAndAttach(ctx, {
+      section: TEXT.FILES,
       url,
-      false, // No "Set titles from filenames" for Files/RMS
-      Steps.IMPORT_RMS,
-      i,
-      baselineCount
-    );
+      baselineCount: baselineCount + successCount,
+      expectedCountIncrease: 1,
+      setTitlesFromFilenames: false,
+      step: Steps.IMPORT_RMS,
+      index: i,
+    });
 
     if (!result.success) {
-      return result;
+      log.error({ url, index: i }, 'RMS file import failed');
+      return {
+        success: false,
+        error: result.error,
+        successCount,
+        totalCount: urls.length,
+        allVerified: false,
+      };
     }
+
+    successCount++;
+    log.info({ successCount, totalCount: urls.length }, 'RMS file imported successfully');
 
     // Small delay between imports
     if (i < urls.length - 1) {
@@ -684,32 +814,49 @@ async function importRmsFiles(
   // Final verification
   const finalCount = await getMediaRowCount(ctx.page, TEXT.FILES);
   const expectedCount = baselineCount + urls.length;
+  const allVerified = finalCount >= expectedCount;
 
-  if (finalCount >= expectedCount) {
+  if (allVerified) {
     log.info({ baselineCount, finalCount, expectedCount }, 'All RMS files imported and VERIFIED');
   } else {
-    log.warn({ baselineCount, finalCount, expectedCount }, 'Files count lower than expected, but individual imports succeeded');
+    log.warn({ baselineCount, finalCount, expectedCount, successCount },
+      'Final count verification failed - some items may not have attached');
   }
 
-  return { success: true };
+  return {
+    success: true,
+    successCount,
+    totalCount: urls.length,
+    allVerified,
+  };
+}
+
+/**
+ * Result of adding 3D content
+ */
+interface Add3DContentResult {
+  success: boolean;
+  verified: boolean;
+  error?: DeliveryError;
 }
 
 /**
  * Adds 3D Content (iGuide tour) via the modal with proper verification.
  *
- * STATE-DRIVEN APPROACH with explicit assertions:
+ * REQUIREMENTS:
  * - Title must ALWAYS be exactly: "iGuide 3D Virtual Tour"
  * - Display type must ALWAYS be: "Both (Branded + Unbranded)"
  * - Explicit assertions verify input values match expected
  * - Re-applies values if they reset due to re-render
  * - Waits for "Add Content" button to become enabled before clicking
  * - Verifies content appears in media list after modal closes
+ * - Returns verified=true ONLY if hard evidence of attachment exists
  */
 async function add3DContent(
   ctx: AutomationContext,
   tourUrl: string,
   baselineCount: number
-): Promise<{ success: true } | { success: false; error: DeliveryError }> {
+): Promise<Add3DContentResult> {
   const log = logger.child({ run_id: ctx.runId, step: Steps.ADD_3D_CONTENT, tourUrl, baselineCount });
 
   // Check if this exact content already exists (idempotency)
@@ -717,39 +864,44 @@ async function add3DContent(
   if (alreadyExists) {
     log.info('3D Content with title "iGuide 3D Virtual Tour" already exists - skipping (idempotent)');
     await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, 'already_exists');
-    return { success: true };
+    return { success: true, verified: true }; // Already exists = verified
   }
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       log.info({ attempt }, 'Adding 3D Content');
 
-      // STEP 1: Click Add button for 3D Content row
+      // ═══════════════════════════════════════════════════════════════════════
+      // PHASE 0: Open the 3D content modal
+      // ═══════════════════════════════════════════════════════════════════════
       const addButton = getAddButtonForRow(ctx.page, TEXT.THREE_D_CONTENT);
       await addButton.waitFor({ state: 'visible', timeout: TIMEOUTS.ELEMENT_VISIBLE });
       await addButton.click();
       log.debug('Clicked Add button for 3D Content');
 
-      // STEP 2: Wait for modal to appear
+      // Wait for modal to appear
       const modal = get3DContentModal(ctx.page);
       await modal.waitFor({ state: 'visible', timeout: 5000 });
       log.debug('3D Content modal appeared');
 
-      // STEP 3: Set and ASSERT Content Title
+      // ═══════════════════════════════════════════════════════════════════════
+      // PHASE 1: Fill form with REQUIRED values
+      // ═══════════════════════════════════════════════════════════════════════
+
+      // Set and ASSERT Content Title = "iGuide 3D Virtual Tour"
       await setAndAssertTitle(ctx, TEXT.IGUIDE_TITLE, log);
 
-      // STEP 4: Set and ASSERT Content Link
+      // Set and ASSERT Content Link
       await setAndAssertLink(ctx, tourUrl, log);
 
-      // STEP 5: Set and ASSERT Display Type
+      // Set and ASSERT Display Type = "Both (Branded + Unbranded)"
       await setAndAssertDisplayType(ctx, log);
 
-      // STEP 6: FINAL ASSERTION - Verify all values before clicking Add Content
+      // FINAL ASSERTION - Verify all values before clicking Add Content
       // This catches any re-renders that may have reset values
       const finalValidation = await validateFormValues(ctx, TEXT.IGUIDE_TITLE, tourUrl, log);
       if (!finalValidation.valid) {
         log.warn({ issues: finalValidation.issues }, 'Form values changed - re-applying...');
-        // Re-apply any values that were reset
         if (!finalValidation.titleMatch) {
           await setAndAssertTitle(ctx, TEXT.IGUIDE_TITLE, log);
         }
@@ -761,11 +913,13 @@ async function add3DContent(
         }
       }
 
-      // STEP 7: Wait for Add Content button to be enabled
+      // ═══════════════════════════════════════════════════════════════════════
+      // PHASE 2: Wait for Add Content button to be enabled and click it
+      // ═══════════════════════════════════════════════════════════════════════
       const addContentButton = getAddContentButton(ctx.page);
       await addContentButton.waitFor({ state: 'visible', timeout: 5000 });
 
-      // Wait for button to be enabled (not disabled)
+      // Wait for button to be enabled
       await ctx.page.waitForFunction(
         `(() => {
           const btn = document.querySelector('button[class*="bg-primary"]');
@@ -773,72 +927,68 @@ async function add3DContent(
           const text = btn.textContent || '';
           return text.includes('Add Content') && !btn.disabled;
         })()`,
-        { timeout: TIMEOUTS.COMMIT_BUTTON_ENABLED }
+        { timeout: TIMEOUTS.ADD_BUTTON_ENABLED }
       );
 
       log.info('Add Content button is enabled - clicking...');
       await addContentButton.click();
 
-      // STEP 8: Wait for modal to close (state-driven)
+      // Wait for modal to close
       log.info('Waiting for 3D Content modal to close...');
       const modalClosed = await waitForModalClose(ctx.page, TIMEOUTS.MODAL_CLOSE);
-
       if (!modalClosed) {
-        log.warn('Modal did not close within timeout - checking if content was added anyway');
+        log.warn('Modal did not close within timeout - continuing to verification');
       } else {
         log.debug('3D Content modal closed');
       }
 
-      // STEP 9: Wait for media section to update and VERIFY content was added
-      log.info('Verifying 3D Content was added...');
+      // ═══════════════════════════════════════════════════════════════════════
+      // PHASE 3: Verify content was added (exponential backoff)
+      // ═══════════════════════════════════════════════════════════════════════
+      log.info('Phase 3: Verifying 3D Content was added...');
 
-      // Method 1: Check if item with title appears (most reliable)
-      const contentExists = await waitFor3DContentWithTitle(ctx.page, TEXT.IGUIDE_TITLE, TIMEOUTS.POST_VERIFY);
-      if (contentExists) {
-        log.info('Post-condition VERIFIED: 3D Content with title visible');
-        await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, 'success');
-        return { success: true };
-      }
-
-      // Method 2: Check if count incremented
-      const updateResult = await waitForMediaSectionUpdate(
-        ctx.page,
-        TEXT.THREE_D_CONTENT,
+      const verified = await verify3DContentWithBackoff(ctx, {
+        expectedTitle: TEXT.IGUIDE_TITLE,
         baselineCount,
-        TIMEOUTS.POST_VERIFY
-      );
+        timeout: TIMEOUTS.COUNT_VERIFICATION,
+      });
 
-      if (updateResult.updated) {
-        log.info({ baselineCount, currentCount: updateResult.newCount }, 'Post-condition VERIFIED: 3D Content count increased');
+      if (verified.success) {
+        log.info({
+          baselineCount,
+          newCount: verified.newCount,
+          method: verified.method,
+        }, '3D Content VERIFIED');
         await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, 'success');
-        return { success: true };
+        return { success: true, verified: true };
       }
+
+      // Verification failed
+      log.error({
+        baselineCount,
+        newCount: verified.newCount,
+      }, '3D Content verification failed');
 
       // Check for error toast
       const errorToast = getErrorToast(ctx.page);
       if (await errorToast.isVisible()) {
         const errorText = await errorToast.textContent();
+        log.error({ errorText }, 'Error toast visible after 3D content add');
         throw new Error(`Add 3D Content failed: ${errorText}`);
       }
 
-      // Verification failed - only screenshot if UI is idle
       await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, `verification_failed_${attempt}`);
-      throw new Error(`Verification failed: 3D Content not visible after add (baseline: ${baselineCount}, current: ${updateResult.newCount})`);
+      throw new Error(`Verification failed: 3D Content not visible (baseline: ${baselineCount}, current: ${verified.newCount})`);
 
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      log.warn({ attempt, error: errorMessage }, 'Add 3D Content attempt failed');
+      log.warn({ attempt, error: errorMessage }, `Add 3D Content attempt ${attempt}/${MAX_RETRIES} failed`);
 
-      // Only screenshot during true failures, not loading states
+      // Screenshot on failure
       await takeScreenshot(ctx, Steps.ADD_3D_CONTENT, `error_attempt_${attempt}`);
 
       // Close any open modal before retry
-      try {
-        await ctx.page.keyboard.press('Escape');
-        await ctx.page.waitForTimeout(300);
-      } catch {
-        // Ignore
-      }
+      await closeOpenModals(ctx);
 
       if (attempt < MAX_RETRIES) {
         log.info(`Retrying in ${RETRY_DELAY_MS}ms...`);
@@ -849,12 +999,62 @@ async function add3DContent(
 
   return {
     success: false,
+    verified: false,
     error: {
       code: ErrorCodes.ACTION_FAILED,
-      message: `Failed to add 3D Content after ${MAX_RETRIES} retries (UI was idle, action did not succeed)`,
+      message: `Failed to add 3D Content after ${MAX_RETRIES} retries`,
       retryable: true,
     },
   };
+}
+
+/**
+ * Verifies 3D content was added using title match or count increase, with exponential backoff.
+ */
+async function verify3DContentWithBackoff(
+  ctx: AutomationContext,
+  options: {
+    expectedTitle: string;
+    baselineCount: number;
+    timeout: number;
+  }
+): Promise<{ success: boolean; newCount: number; method: string }> {
+  const { expectedTitle, baselineCount, timeout } = options;
+  const log = logger.child({ run_id: ctx.runId, expectedTitle, baselineCount });
+  const startTime = Date.now();
+  const backoffIntervals = TIMEOUTS.BACKOFF_INTERVALS;
+  let backoffIndex = 0;
+
+  while (Date.now() - startTime < timeout) {
+    // Method 1: Check if title is visible (most reliable)
+    const titleVisible = await has3DContentWithTitle(ctx.page, expectedTitle);
+    if (titleVisible) {
+      const currentCount = await getMediaRowCount(ctx.page, TEXT.THREE_D_CONTENT);
+      return { success: true, newCount: currentCount, method: 'title_match' };
+    }
+
+    // Method 2: Check count increase
+    const currentCount = await getMediaRowCount(ctx.page, TEXT.THREE_D_CONTENT);
+    if (currentCount > baselineCount) {
+      return { success: true, newCount: currentCount, method: 'count_increase' };
+    }
+
+    // Wait with exponential backoff
+    const waitTime = backoffIntervals[Math.min(backoffIndex, backoffIntervals.length - 1)] ?? 5000;
+    log.debug({ currentCount, waitTime }, '3D Content not yet visible, waiting...');
+    await delay(waitTime);
+    backoffIndex++;
+  }
+
+  // Final check
+  const titleVisible = await has3DContentWithTitle(ctx.page, expectedTitle);
+  const finalCount = await getMediaRowCount(ctx.page, TEXT.THREE_D_CONTENT);
+
+  if (titleVisible || finalCount > baselineCount) {
+    return { success: true, newCount: finalCount, method: titleVisible ? 'title_match' : 'count_increase' };
+  }
+
+  return { success: false, newCount: finalCount, method: 'none' };
 }
 
 /**
@@ -1364,9 +1564,16 @@ export async function runDeliveryAutomation(
       baselineCounts.floorPlans
     );
     if (!floorplanResult.success) {
-      return { success: false, error: floorplanResult.error, actions };
+      return { success: false, error: floorplanResult.error!, actions };
     }
-    actions.imported_floorplans = manifest.sources.floorplan_urls.length > 0;
+    // CRITICAL: Only set flag to true if ALL items were verified attached
+    actions.imported_floorplans = floorplanResult.allVerified && floorplanResult.totalCount > 0;
+    if (floorplanResult.totalCount > 0 && !floorplanResult.allVerified) {
+      log.warn({
+        successCount: floorplanResult.successCount,
+        totalCount: floorplanResult.totalCount,
+      }, 'Floor plans: not all items verified - imported_floorplans set to false');
+    }
 
     // Step 4: Import RMS files with verification
     const rmsResult = await importRmsFiles(
@@ -1375,9 +1582,16 @@ export async function runDeliveryAutomation(
       baselineCounts.files
     );
     if (!rmsResult.success) {
-      return { success: false, error: rmsResult.error, actions };
+      return { success: false, error: rmsResult.error!, actions };
     }
-    actions.imported_rms = manifest.sources.rms_urls.length > 0;
+    // CRITICAL: Only set flag to true if ALL items were verified attached
+    actions.imported_rms = rmsResult.allVerified && rmsResult.totalCount > 0;
+    if (rmsResult.totalCount > 0 && !rmsResult.allVerified) {
+      log.warn({
+        successCount: rmsResult.successCount,
+        totalCount: rmsResult.totalCount,
+      }, 'RMS files: not all items verified - imported_rms set to false');
+    }
 
     // Step 5: Add 3D Content (iGuide tour) with verification
     const content3dResult = await add3DContent(
@@ -1386,9 +1600,18 @@ export async function runDeliveryAutomation(
       baselineCounts.threeDContent
     );
     if (!content3dResult.success) {
-      return { success: false, error: content3dResult.error, actions };
+      return {
+        success: false,
+        error: content3dResult.error ?? {
+          code: ErrorCodes.ACTION_FAILED,
+          message: 'Failed to add 3D Content',
+          retryable: true,
+        },
+        actions,
+      };
     }
-    actions.added_3d_content = true;
+    // CRITICAL: Only set flag to true if verified
+    actions.added_3d_content = content3dResult.verified;
 
     // Step 6: Save the listing
     const saveResult = await saveListing(ctx);

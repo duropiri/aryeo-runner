@@ -14,22 +14,22 @@ import type { Page, Locator } from 'playwright';
 // ============================================================================
 
 export const TIMEOUTS = {
-  // URL staging (file download/processing) - can be slow for large files
-  URL_STAGING: 90000,
-  // Wait for commit button to be enabled after staging complete
-  COMMIT_BUTTON_ENABLED: 30000,
+  // Phase 1: Wait for Add button to become enabled after clicking Import (server-side processing)
+  ADD_BUTTON_ENABLED: 90000,
+  // Phase 2: Wait for count verification after clicking Add (with exponential backoff)
+  COUNT_VERIFICATION: 90000,
   // Modal close after commit
   MODAL_CLOSE: 45000,
   // Post-condition verification (count changed, item appeared)
-  POST_VERIFY: 45000,
+  POST_VERIFY: 60000,
   // Default element visibility
   ELEMENT_VISIBLE: 10000,
   // State polling interval (how often to check UI state)
-  STATE_POLL_INTERVAL: 250,
-  // Maximum time to wait for upload progress to complete
-  UPLOAD_PROGRESS_COMPLETE: 120000,
+  STATE_POLL_INTERVAL: 500,
   // Time to wait for media section re-render after modal closes
-  MEDIA_SECTION_RERENDER: 10000,
+  MEDIA_SECTION_RERENDER: 15000,
+  // Exponential backoff intervals for count verification
+  BACKOFF_INTERVALS: [2000, 4000, 8000, 15000, 30000] as readonly number[],
 } as const;
 
 // ============================================================================
@@ -224,11 +224,24 @@ export function getImportButton(page: Page): Locator {
 
 /**
  * Gets the "Set titles from filenames" checkbox (Floor Plans only)
- * Structure: <label id="set_titles"><input name="set_titles">...<div>Set titles from filenames</div></label>
+ * IMPORTANT: Must target the actual input element, not the label!
+ * Structure: <label id="set_titles"><input name="set_titles" type="checkbox">...<div>Set titles from filenames</div></label>
  */
 export function getSetTitlesCheckbox(page: Page): Locator {
+  // Primary: Use role-based selector (recommended by Playwright)
+  return page.getByRole('checkbox', { name: /set titles from filenames/i })
+    // Fallback: Find the input inside the label
+    .or(page.locator('label#set_titles input[type="checkbox"]'))
+    .or(page.locator('label').filter({ hasText: /set titles from filenames/i }).locator('input[type="checkbox"]'))
+    .or(page.locator('input[name="set_titles"]'));
+}
+
+/**
+ * Gets the label for "Set titles from filenames" checkbox (for clicking if checkbox is hidden)
+ */
+export function getSetTitlesLabel(page: Page): Locator {
   return page.locator('label#set_titles')
-    .or(page.locator('label').filter({ hasText: 'Set titles from filenames' }));
+    .or(page.locator('label').filter({ hasText: /set titles from filenames/i }));
 }
 
 /**
@@ -622,24 +635,28 @@ export async function waitForAnyVisible(
 // ============================================================================
 
 /**
- * Upload state for deterministic automation
+ * Upload UI state snapshot for diagnostics
  */
 export interface UploadUIState {
+  // Add button state - PRIMARY indicator for readiness
+  addButtonVisible: boolean;
+  addButtonEnabled: boolean;
+  addButtonText: string | null;
+  // Secondary indicators (for diagnostics, not blocking)
   hasProgressBar: boolean;
   progressPercent: number | null;
   hasSkeletonLoader: boolean;
   hasSpinnerInModal: boolean;
-  hasStagedFile: boolean;
-  hasRealFilename: boolean;
-  isAddFilesButtonEnabled: boolean;
-  isAddFilesButtonVisible: boolean;
+  // Error state
   hasErrorMessage: boolean;
   errorMessage: string | null;
+  modalErrorText: string | null;
+  // Current counts (for diagnostics)
+  timestamp: number;
 }
 
 /**
  * Gets the upload progress bar element in the Uploadcare widget
- * Progress is shown as a bar during file download/processing
  */
 export function getUploadProgressBar(page: Page): Locator {
   return page.locator('uc-progress-bar, [class*="uc-progress"], [class*="progress-bar"], [role="progressbar"]')
@@ -649,7 +666,6 @@ export function getUploadProgressBar(page: Page): Locator {
 
 /**
  * Gets skeleton/placeholder loaders in the upload widget
- * These appear when a file is being processed but not yet ready
  */
 export function getSkeletonLoader(page: Page): Locator {
   return page.locator('[class*="skeleton"], [class*="placeholder"], [class*="loading-placeholder"]')
@@ -668,64 +684,53 @@ export function getUploadModalSpinner(page: Page): Locator {
 }
 
 /**
- * Gets file items that have completed staging (have real filenames, not placeholders)
- * A staged file should show actual filename text, thumbnail, or completion indicator
+ * Gets any error message visible in the upload modal
  */
-export function getCompletedStagedFile(page: Page): Locator {
-  // Files that have completed staging have a done state or show file info
-  return page.locator('uc-file-item[data-state="idle"], uc-file-item[data-state="done"]')
-    .or(page.locator('.uc-file-item--done, .uc-file-item--idle'))
-    .or(page.locator('uc-file-item:not([data-state="uploading"]):not([data-state="processing"])'));
+export function getModalErrorMessage(page: Page): Locator {
+  return page.locator('uc-file-uploader-inline [class*="error"], uc-file-uploader-inline [class*="failed"]')
+    .or(page.locator('[role="alert"]').filter({ hasText: /error|failed|invalid/i }))
+    .or(page.locator('[class*="modal"] [class*="error"]'));
 }
 
 /**
- * Gets the filename text element within a staged file item
- */
-export function getStagedFileName(page: Page): Locator {
-  return page.locator('uc-file-item .uc-file-name, uc-file-item [class*="file-name"]')
-    .or(page.locator('.uc-file-item__name'))
-    .or(page.locator('uc-upload-list [class*="filename"]'));
-}
-
-/**
- * Gets the thumbnail/preview image for a staged file
- */
-export function getStagedFileThumbnail(page: Page): Locator {
-  return page.locator('uc-file-item img, uc-file-item [class*="thumb"], uc-file-item [class*="preview"]')
-    .or(page.locator('.uc-file-item__thumb, .uc-file-item__preview'));
-}
-
-/**
- * Comprehensive function to capture the current upload UI state
- * This is the key function for state-driven automation
+ * Captures comprehensive UI state snapshot for diagnostics
+ * CRITICAL: This function should NEVER throw - always return a valid state
  */
 export async function getUploadUIState(page: Page): Promise<UploadUIState> {
   const state: UploadUIState = {
+    addButtonVisible: false,
+    addButtonEnabled: false,
+    addButtonText: null,
     hasProgressBar: false,
     progressPercent: null,
     hasSkeletonLoader: false,
     hasSpinnerInModal: false,
-    hasStagedFile: false,
-    hasRealFilename: false,
-    isAddFilesButtonEnabled: false,
-    isAddFilesButtonVisible: false,
     hasErrorMessage: false,
     errorMessage: null,
+    modalErrorText: null,
+    timestamp: Date.now(),
   };
 
   try {
-    // Check for progress bar
+    // PRIMARY: Check Add Files button state
+    const addFilesButton = getCommitFilesButton(page);
+    state.addButtonVisible = await addFilesButton.isVisible().catch(() => false);
+
+    if (state.addButtonVisible) {
+      state.addButtonEnabled = !(await addFilesButton.isDisabled().catch(() => true));
+      state.addButtonText = await addFilesButton.textContent().catch(() => null);
+    }
+
+    // SECONDARY: Check for progress bar (informational only)
     const progressBar = getUploadProgressBar(page);
     state.hasProgressBar = await progressBar.isVisible().catch(() => false);
 
     if (state.hasProgressBar) {
-      // Try to extract progress percentage
       try {
         const progressValue = await progressBar.getAttribute('aria-valuenow');
         if (progressValue) {
           state.progressPercent = parseInt(progressValue, 10);
         } else {
-          // Try style width for CSS-based progress bars
           const style = await progressBar.getAttribute('style');
           if (style) {
             const widthMatch = style.match(/width:\s*(\d+(?:\.\d+)?)%/);
@@ -739,213 +744,178 @@ export async function getUploadUIState(page: Page): Promise<UploadUIState> {
       }
     }
 
-    // Check for skeleton loaders
-    const skeleton = getSkeletonLoader(page);
-    state.hasSkeletonLoader = await skeleton.isVisible().catch(() => false);
+    // SECONDARY: Check for skeleton loaders (informational only)
+    state.hasSkeletonLoader = await getSkeletonLoader(page).isVisible().catch(() => false);
 
-    // Check for spinners in modal
-    const spinner = getUploadModalSpinner(page);
-    state.hasSpinnerInModal = await spinner.isVisible().catch(() => false);
+    // SECONDARY: Check for spinners (informational only)
+    state.hasSpinnerInModal = await getUploadModalSpinner(page).isVisible().catch(() => false);
 
-    // Check for staged file preview
-    const stagedPreview = getStagedFilePreview(page);
-    state.hasStagedFile = await stagedPreview.isVisible().catch(() => false);
-
-    // Check if staged file has a real filename (not placeholder)
-    if (state.hasStagedFile) {
-      const filename = getStagedFileName(page);
-      const thumbnail = getStagedFileThumbnail(page);
-      const completedFile = getCompletedStagedFile(page);
-
-      const hasFilename = await filename.isVisible().catch(() => false);
-      const hasThumbnail = await thumbnail.isVisible().catch(() => false);
-      const isCompleted = await completedFile.isVisible().catch(() => false);
-
-      state.hasRealFilename = hasFilename || hasThumbnail || isCompleted;
-    }
-
-    // Check Add Files button state
-    const addFilesButton = getCommitFilesButton(page);
-    state.isAddFilesButtonVisible = await addFilesButton.isVisible().catch(() => false);
-
-    if (state.isAddFilesButtonVisible) {
-      const isDisabled = await addFilesButton.isDisabled().catch(() => true);
-      state.isAddFilesButtonEnabled = !isDisabled;
-    }
-
-    // Check for error messages
+    // ERROR: Check for error messages
     const errorToast = getErrorToast(page);
     state.hasErrorMessage = await errorToast.isVisible().catch(() => false);
-
     if (state.hasErrorMessage) {
       state.errorMessage = await errorToast.textContent().catch(() => null);
     }
 
+    // Check for modal-specific error
+    const modalError = getModalErrorMessage(page);
+    if (await modalError.isVisible().catch(() => false)) {
+      state.modalErrorText = await modalError.textContent().catch(() => null);
+      state.hasErrorMessage = true;
+    }
+
   } catch {
-    // Return partial state on error
+    // Return partial state on error - never throw
   }
 
   return state;
 }
 
 /**
- * Determines if the upload is still in progress based on UI state
+ * Checks if the UI is ready for clicking the Add button
+ *
+ * CRITICAL FIX: The PRIMARY condition is Add button enabled.
+ * Skeleton loaders and progress bars should NOT block if the Add button is enabled.
+ * For server-side URL imports, the file may never "stage" visually.
  */
-export function isUploadInProgress(state: UploadUIState): boolean {
-  // Upload is in progress if:
-  // - Progress bar is visible AND not at 100%
-  // - Skeleton loaders are visible
-  // - Spinner is visible in modal
-  // - Add Files button is visible but disabled (processing)
-
-  if (state.hasProgressBar && (state.progressPercent === null || state.progressPercent < 100)) {
-    return true;
-  }
-
-  if (state.hasSkeletonLoader) {
-    return true;
-  }
-
-  if (state.hasSpinnerInModal) {
-    return true;
-  }
-
-  // If staged file exists but no real filename yet, still processing
-  if (state.hasStagedFile && !state.hasRealFilename) {
-    return true;
-  }
-
-  // If button is visible but disabled, still processing
-  if (state.isAddFilesButtonVisible && !state.isAddFilesButtonEnabled) {
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * Determines if the UI is ready for the "Add Files" action
- */
-export function isUIReadyForCommit(state: UploadUIState): boolean {
-  // UI is ready when:
-  // - No progress bar OR progress at 100%
-  // - No skeleton loaders
-  // - No spinner in modal
-  // - Staged file has real filename OR thumbnail
-  // - Add Files button is visible AND enabled
-  // - No error message
-
+export function isReadyToClickAdd(state: UploadUIState): boolean {
+  // If there's an error, not ready
   if (state.hasErrorMessage) {
     return false;
   }
 
-  if (state.hasProgressBar && state.progressPercent !== null && state.progressPercent < 100) {
-    return false;
-  }
-
-  if (state.hasSkeletonLoader) {
-    return false;
-  }
-
-  if (state.hasSpinnerInModal) {
-    return false;
-  }
-
-  if (state.hasStagedFile && !state.hasRealFilename) {
-    return false;
-  }
-
-  return state.isAddFilesButtonVisible && state.isAddFilesButtonEnabled;
+  // PRIMARY CONDITION: Add button must be visible AND enabled
+  return state.addButtonVisible && state.addButtonEnabled;
 }
 
 /**
- * Waits for the upload to complete and UI to be ready for commit
- * This is the state-machine approach - no blind delays
+ * Checks if an upload error has occurred
+ */
+export function hasUploadError(state: UploadUIState): boolean {
+  return state.hasErrorMessage || state.modalErrorText !== null;
+}
+
+/**
+ * Gets the error message from state
+ */
+export function getUploadErrorMessage(state: UploadUIState): string | null {
+  return state.modalErrorText || state.errorMessage || null;
+}
+
+/**
+ * Waits for the Add button to become enabled (Phase 1)
+ *
+ * This is the ONLY condition we wait for. Skeleton loaders and progress bars
+ * are logged but do NOT block the process if Add button is enabled.
+ *
  * @returns Object with ready status and final state
  */
-export async function waitForUploadReadyState(
+export async function waitForAddButtonEnabled(
   page: Page,
-  timeout: number = TIMEOUTS.UPLOAD_PROGRESS_COMPLETE
+  timeout: number = TIMEOUTS.ADD_BUTTON_ENABLED
 ): Promise<{ ready: boolean; state: UploadUIState; reason: string }> {
   const startTime = Date.now();
   let lastState: UploadUIState = await getUploadUIState(page);
   let stableCount = 0;
-  const requiredStableChecks = 3; // Must be stable for 3 consecutive checks
+  const requiredStableChecks = 2; // Must be stable for 2 consecutive checks
 
   while (Date.now() - startTime < timeout) {
     const currentState = await getUploadUIState(page);
 
     // Check for error state first
-    if (currentState.hasErrorMessage) {
+    if (hasUploadError(currentState)) {
       return {
         ready: false,
         state: currentState,
-        reason: `Upload error: ${currentState.errorMessage || 'Unknown error'}`,
+        reason: `Upload error: ${getUploadErrorMessage(currentState) || 'Unknown error'}`,
       };
     }
 
-    // Check if ready for commit
-    if (isUIReadyForCommit(currentState)) {
+    // PRIMARY CHECK: Is Add button enabled?
+    if (isReadyToClickAdd(currentState)) {
       stableCount++;
       if (stableCount >= requiredStableChecks) {
         return {
           ready: true,
           state: currentState,
-          reason: 'Upload complete and UI ready for commit',
+          reason: 'Add button is enabled and ready',
         };
       }
     } else {
-      stableCount = 0; // Reset stability counter if state changes
-    }
-
-    // Log progress for debugging
-    if (currentState.hasProgressBar && currentState.progressPercent !== null) {
-      // Progress is being made
+      stableCount = 0;
     }
 
     lastState = currentState;
     await page.waitForTimeout(TIMEOUTS.STATE_POLL_INTERVAL);
   }
 
-  // Timeout - determine why
-  if (isUploadInProgress(lastState)) {
-    return {
-      ready: false,
-      state: lastState,
-      reason: 'Timeout: upload still in progress',
-    };
-  }
-
-  if (!lastState.hasStagedFile) {
-    return {
-      ready: false,
-      state: lastState,
-      reason: 'Timeout: no staged file appeared',
-    };
-  }
-
-  if (!lastState.isAddFilesButtonVisible) {
-    return {
-      ready: false,
-      state: lastState,
-      reason: 'Timeout: Add Files button not visible',
-    };
-  }
-
-  if (!lastState.isAddFilesButtonEnabled) {
-    return {
-      ready: false,
-      state: lastState,
-      reason: 'Timeout: Add Files button not enabled',
-    };
-  }
-
+  // Timeout - provide detailed reason
+  const reason = buildTimeoutReason(lastState);
   return {
     ready: false,
     state: lastState,
-    reason: 'Timeout: unknown state issue',
+    reason,
   };
 }
+
+/**
+ * Builds a detailed timeout reason from the current state
+ */
+function buildTimeoutReason(state: UploadUIState): string {
+  const issues: string[] = [];
+
+  if (!state.addButtonVisible) {
+    issues.push('Add button not visible');
+  } else if (!state.addButtonEnabled) {
+    issues.push('Add button visible but disabled');
+  }
+
+  if (state.hasProgressBar) {
+    issues.push(`Progress bar visible (${state.progressPercent ?? 'unknown'}%)`);
+  }
+
+  if (state.hasSkeletonLoader) {
+    issues.push('Skeleton loader visible');
+  }
+
+  if (state.hasSpinnerInModal) {
+    issues.push('Spinner visible in modal');
+  }
+
+  if (state.hasErrorMessage) {
+    issues.push(`Error: ${state.errorMessage || state.modalErrorText || 'unknown'}`);
+  }
+
+  return `Timeout waiting for Add button: ${issues.join(', ') || 'unknown issue'}`;
+}
+
+/**
+ * Creates a compact UI snapshot for logging/diagnostics
+ */
+export function formatUISnapshot(state: UploadUIState): string {
+  return JSON.stringify({
+    addBtn: state.addButtonVisible ? (state.addButtonEnabled ? 'enabled' : 'disabled') : 'hidden',
+    addText: state.addButtonText,
+    progress: state.hasProgressBar ? (state.progressPercent ?? '?') + '%' : null,
+    skeleton: state.hasSkeletonLoader,
+    spinner: state.hasSpinnerInModal,
+    error: state.hasErrorMessage ? (state.errorMessage || state.modalErrorText) : null,
+  });
+}
+
+// Legacy exports for backwards compatibility
+export const isUploadInProgress = (state: UploadUIState): boolean => {
+  // If Add button is enabled, we're NOT in progress (even if skeleton is showing)
+  if (state.addButtonVisible && state.addButtonEnabled) {
+    return false;
+  }
+  // Otherwise, check for active indicators
+  return state.hasProgressBar || state.hasSkeletonLoader || state.hasSpinnerInModal;
+};
+
+export const isUIReadyForCommit = isReadyToClickAdd;
+
+export const waitForUploadReadyState = waitForAddButtonEnabled;
 
 // ============================================================================
 // MEDIA SECTION VERIFICATION
