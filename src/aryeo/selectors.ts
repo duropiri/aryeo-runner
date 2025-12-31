@@ -10,6 +10,25 @@
 import type { Page, Locator } from 'playwright';
 
 // ============================================================================
+// TIMEOUTS (centralized for easy tuning)
+// ============================================================================
+
+export const TIMEOUTS = {
+  // URL staging (file download/processing) - can be slow for large files
+  URL_STAGING: 60000,
+  // Wait for commit button to be enabled
+  COMMIT_BUTTON_ENABLED: 20000,
+  // Modal close after commit
+  MODAL_CLOSE: 30000,
+  // Post-condition verification (count changed, item appeared)
+  POST_VERIFY: 30000,
+  // Default element visibility
+  ELEMENT_VISIBLE: 10000,
+  // Short action delay
+  ACTION_DELAY: 500,
+} as const;
+
+// ============================================================================
 // TEXT CONSTANTS (for easy updates)
 // ============================================================================
 
@@ -100,6 +119,67 @@ export function getAddButtonNearLabel(page: Page, rowLabel: string): Locator {
 }
 
 // ============================================================================
+// COUNT BADGE LOCATORS
+// ============================================================================
+
+/**
+ * Gets the count badge for a media row.
+ * The count is typically shown as a badge like "(2)" or in the label text.
+ * Structure: <span class="text-heading">Floor Plans</span><span class="badge">(2)</span>
+ * Or embedded in label: "Floor Plans (2)"
+ */
+export function getMediaRowCountBadge(page: Page, rowLabel: string): Locator {
+  const row = getMediaRow(page, rowLabel);
+  // Try to find a badge/count element within the row header area
+  return row.locator('span.badge, span[class*="count"], span[class*="badge"]').first()
+    .or(row.locator('span').filter({ hasText: /^\(\d+\)$/ }).first());
+}
+
+/**
+ * Parses the count from a media row label or badge.
+ * Returns 0 if count cannot be determined.
+ */
+export async function getMediaRowCount(page: Page, rowLabel: string): Promise<number> {
+  const row = getMediaRow(page, rowLabel);
+
+  try {
+    // Strategy 1: Look for the label span and extract count from text like "Floor Plans (2)"
+    const labelSpan = row.locator('span.text-heading').first();
+    const labelText = await labelSpan.textContent({ timeout: 5000 });
+    if (labelText) {
+      const match = labelText.match(/\((\d+)\)/);
+      if (match && match[1]) {
+        return parseInt(match[1], 10);
+      }
+    }
+
+    // Strategy 2: Look for separate badge element
+    const badge = getMediaRowCountBadge(page, rowLabel);
+    if (await badge.isVisible({ timeout: 2000 })) {
+      const badgeText = await badge.textContent();
+      if (badgeText) {
+        const match = badgeText.match(/(\d+)/);
+        if (match && match[1]) {
+          return parseInt(match[1], 10);
+        }
+      }
+    }
+
+    // Strategy 3: Count visible items in the row's content area
+    // This is a fallback - count the actual media items displayed
+    const items = row.locator('[class*="item"], [class*="thumbnail"], [class*="preview"], li, img').first();
+    const itemCount = await items.count();
+    if (itemCount > 0) {
+      return itemCount;
+    }
+  } catch {
+    // Could not determine count
+  }
+
+  return 0;
+}
+
+// ============================================================================
 // UPLOAD DIALOG / DROPDOWN LOCATORS
 // ============================================================================
 
@@ -149,10 +229,58 @@ export function getSetTitlesCheckbox(page: Page): Locator {
 
 /**
  * Gets the "Add X Files" button at the bottom of the upload sheet
+ * This is the COMMIT button that must be clicked after staging files
  */
 export function getAddFilesButton(page: Page): Locator {
   return page.locator('button.bg-primary').filter({ hasText: /Add \d+ Files?/i })
-    .or(page.locator('button[variant="primary"]').filter({ hasText: /Add.*Files?/i }));
+    .or(page.locator('button[variant="primary"]').filter({ hasText: /Add.*Files?/i }))
+    .or(page.getByRole('button', { name: /^Add \d+ Files?$/i }));
+}
+
+/**
+ * Gets the commit button by looking for "Add 1 File" or "Add X Files" patterns
+ * More specific than getAddFilesButton - looks for exact button styles
+ */
+export function getCommitFilesButton(page: Page): Locator {
+  // The commit button is typically a primary button at the bottom of the upload modal
+  // with text like "Add 1 File" or "Add 3 Files"
+  return page.locator('button.bg-primary, button[class*="bg-primary"]')
+    .filter({ hasText: /^Add \d+ Files?$/i })
+    .or(page.locator('uc-file-uploader-inline button.uc-primary-btn').filter({ hasText: /Add/i }))
+    .or(page.locator('[class*="modal"] button.bg-primary').filter({ hasText: /Add.*File/i }));
+}
+
+/**
+ * Gets the upload modal/sheet container
+ */
+export function getUploadModal(page: Page): Locator {
+  return page.locator('uc-file-uploader-inline')
+    .or(page.locator('[class*="upload"][class*="modal"]'))
+    .or(page.locator('[role="dialog"]').filter({ hasText: /upload|add.*file/i }));
+}
+
+/**
+ * Gets the staging/preview area that shows files ready to be committed
+ * Uploadcare shows a preview of the file before the final "Add X Files" commit
+ */
+export function getStagedFilePreview(page: Page): Locator {
+  return page.locator('uc-file-item, [class*="file-preview"], [class*="staged-file"], [class*="uc-file"]')
+    .or(page.locator('uc-upload-list'))
+    .or(page.locator('[class*="upload-list"]'));
+}
+
+/**
+ * Checks if a file is currently staged (ready for commit)
+ * Returns true if there's at least one staged file visible
+ */
+export async function hasStagedFiles(page: Page): Promise<boolean> {
+  try {
+    const staged = getStagedFilePreview(page);
+    const count = await staged.count();
+    return count > 0;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -163,16 +291,28 @@ export function getDoneButton(page: Page): Locator {
     .or(page.locator('button.uc-primary-btn').filter({ hasText: 'Done' }));
 }
 
+/**
+ * Gets any cancel/close button in the upload modal
+ */
+export function getUploadCancelButton(page: Page): Locator {
+  return page.locator('button').filter({ hasText: /cancel|close/i })
+    .or(page.locator('[aria-label="Close"]'))
+    .or(page.locator('button[class*="close"]'));
+}
+
 // ============================================================================
 // 3D CONTENT MODAL LOCATORS
 // ============================================================================
 
 /**
  * Gets the 3D Content modal/dialog
+ * The modal appears when clicking "Add" on the 3D Content row
  */
 export function get3DContentModal(page: Page): Locator {
+  // The modal should contain fields for title, link, and display type
   return page.getByRole('dialog')
-    .or(page.locator('[class*="modal"]').filter({ hasText: /3D|content|tour/i }));
+    .or(page.locator('[class*="modal"]').filter({ hasText: /3D|content|tour/i }))
+    .or(page.locator('div.shadow-xl').filter({ hasText: /Content Title|Content Link/i }));
 }
 
 /**
@@ -182,7 +322,9 @@ export function get3DContentModal(page: Page): Locator {
 export function getContentTitleInput(page: Page): Locator {
   return page.locator('input#ContentTitle\\:')
     .or(page.locator('input[id="ContentTitle:"]'))
-    .or(page.getByPlaceholder('Title'));
+    .or(page.locator('input[id*="ContentTitle"]'))
+    .or(page.getByPlaceholder('Title'))
+    .or(page.locator('label').filter({ hasText: /Content Title/i }).locator('xpath=following-sibling::input[1]'));
 }
 
 /**
@@ -192,17 +334,22 @@ export function getContentTitleInput(page: Page): Locator {
 export function getContentLinkInput(page: Page): Locator {
   return page.locator('input#Pasteyourlinkbelow\\:')
     .or(page.locator('input[id="Pasteyourlinkbelow:"]'))
-    .or(page.getByPlaceholder('Content Link'));
+    .or(page.locator('input[id*="Pasteyourlink"]'))
+    .or(page.getByPlaceholder('Content Link'))
+    .or(page.locator('label').filter({ hasText: /link/i }).locator('xpath=following-sibling::input[1]'));
 }
 
 /**
  * Gets the Display Type dropdown/select in 3D Content modal
  * Structure: <select id="DisplayType">
+ * Options: "branded", "unbranded", "both"
  */
 export function getDisplayTypeDropdown(page: Page): Locator {
   return page.locator('select#DisplayType')
     .or(page.locator('select[id="DisplayType"]'))
-    .or(page.getByRole('combobox', { name: /display type/i }));
+    .or(page.locator('select[id*="DisplayType"]'))
+    .or(page.getByRole('combobox', { name: /display type/i }))
+    .or(page.locator('label').filter({ hasText: /Display Type/i }).locator('xpath=following-sibling::select[1]'));
 }
 
 /**
@@ -228,19 +375,44 @@ export function getAddContentButton(page: Page): Locator {
 // ============================================================================
 
 /**
- * Checks if 3D content with a specific title already exists
+ * Checks if 3D content with a specific title already exists in the row
  */
 export function get3DContentItemByTitle(page: Page, title: string): Locator {
-  return page.locator('[class*="content-item"], [class*="media-item"], li, div')
+  const row = getMediaRow(page, TEXT.THREE_D_CONTENT);
+  return row.locator('[class*="content-item"], [class*="media-item"], li, div, span')
     .filter({ hasText: title });
 }
 
 /**
- * Gets all existing 3D content items
+ * Gets all existing 3D content items in the 3D Content row
  */
 export function getExisting3DContentItems(page: Page): Locator {
   const row = getMediaRow(page, TEXT.THREE_D_CONTENT);
-  return row.locator('[class*="item"], [class*="content"]');
+  return row.locator('[class*="item"], [class*="content"], [class*="tour"]');
+}
+
+/**
+ * Counts the number of 3D content items currently visible
+ */
+export async function count3DContentItems(page: Page): Promise<number> {
+  try {
+    const items = getExisting3DContentItems(page);
+    return await items.count();
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Checks if a specific 3D content (by title) already exists
+ */
+export async function has3DContentWithTitle(page: Page, title: string): Promise<boolean> {
+  try {
+    const item = get3DContentItemByTitle(page, title);
+    return await item.isVisible({ timeout: 2000 });
+  } catch {
+    return false;
+  }
 }
 
 // ============================================================================
