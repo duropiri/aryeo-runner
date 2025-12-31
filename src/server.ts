@@ -1,5 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
+import os from 'node:os';
 import Fastify, { type FastifyRequest, type FastifyReply } from 'fastify';
 import cors from '@fastify/cors';
 import { getConfig, loadConfig } from './config.js';
@@ -20,6 +21,12 @@ import {
   type StatusResponse,
   type HealthResponse,
   type ReadinessResponse,
+  type StorageStateUploadResponse,
+  type StorageStateStatusResponse,
+  type AuthStatusResponse,
+  type CookieUploadBody,
+  type PlaywrightStorageState,
+  type PlaywrightCookie,
 } from './types.js';
 
 const VERSION = '1.0.0';
@@ -69,6 +76,243 @@ class RateLimiter {
     const limited = entry.count > this.maxRequests;
 
     return { limited, remaining, resetTime: entry.resetTime };
+  }
+}
+
+// ============================================================================
+// Storage State Helpers
+// ============================================================================
+
+/**
+ * Validates that an object is a valid Playwright storage state.
+ */
+function isValidStorageState(obj: unknown): obj is PlaywrightStorageState {
+  if (!obj || typeof obj !== 'object') return false;
+  const state = obj as Record<string, unknown>;
+
+  if (!Array.isArray(state.cookies)) return false;
+
+  for (const cookie of state.cookies) {
+    if (!cookie || typeof cookie !== 'object') return false;
+    const c = cookie as Record<string, unknown>;
+    if (typeof c.name !== 'string' || !c.name) return false;
+    if (typeof c.value !== 'string') return false;
+    if (typeof c.domain !== 'string' || !c.domain) return false;
+    if (typeof c.path !== 'string' || !c.path) return false;
+  }
+
+  return true;
+}
+
+/**
+ * Gets the soonest expiry time from cookies (ignoring session cookies with -1 or 0).
+ */
+function getSoonestExpiry(cookies: PlaywrightCookie[]): Date | null {
+  let soonest: Date | null = null;
+  const now = Date.now();
+
+  for (const cookie of cookies) {
+    // Skip session cookies (expires -1 or 0 or undefined)
+    if (cookie.expires === undefined || cookie.expires <= 0) continue;
+
+    const expiryMs = cookie.expires * 1000;
+    // Skip already expired cookies
+    if (expiryMs < now) continue;
+
+    const expiryDate = new Date(expiryMs);
+    if (!soonest || expiryDate < soonest) {
+      soonest = expiryDate;
+    }
+  }
+
+  return soonest;
+}
+
+/**
+ * Checks if any cookie is expired.
+ */
+function hasExpiredCookies(cookies: PlaywrightCookie[]): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  for (const cookie of cookies) {
+    // Skip session cookies
+    if (cookie.expires === undefined || cookie.expires <= 0) continue;
+    if (cookie.expires < now) return true;
+  }
+  return false;
+}
+
+/**
+ * Extracts unique domains from cookies.
+ */
+function getUniqueDomains(cookies: PlaywrightCookie[]): string[] {
+  const domains = new Set<string>();
+  for (const cookie of cookies) {
+    domains.add(cookie.domain);
+  }
+  return [...domains].sort();
+}
+
+/**
+ * Extracts unique cookie names from cookies.
+ */
+function getUniqueCookieNames(cookies: PlaywrightCookie[]): string[] {
+  const names = new Set<string>();
+  for (const cookie of cookies) {
+    names.add(cookie.name);
+  }
+  return [...names].sort();
+}
+
+/**
+ * Parses a cookie header string into Playwright cookie objects.
+ * Cookie header format: "name1=value1; name2=value2; ..."
+ */
+function parseCookieHeader(cookieHeader: string, expiresAt?: string): PlaywrightCookie[] {
+  const cookies: PlaywrightCookie[] = [];
+  const pairs = cookieHeader.split(';').map((s) => s.trim()).filter((s) => s);
+
+  // Calculate expires in Unix seconds if expiresAt is provided
+  let expiresUnix: number | undefined;
+  if (expiresAt) {
+    try {
+      const expiryDate = new Date(expiresAt);
+      if (!isNaN(expiryDate.getTime())) {
+        expiresUnix = Math.floor(expiryDate.getTime() / 1000);
+      }
+    } catch {
+      // Ignore invalid date
+    }
+  }
+
+  for (const pair of pairs) {
+    const eqIndex = pair.indexOf('=');
+    if (eqIndex === -1) continue;
+
+    const name = pair.substring(0, eqIndex).trim();
+    const value = pair.substring(eqIndex + 1).trim();
+
+    if (!name) continue;
+
+    // Determine httpOnly based on cookie name (best-effort)
+    // aryeo_session should be httpOnly, XSRF-TOKEN should not be
+    const isSessionCookie = name.toLowerCase().includes('session');
+    const isXsrfCookie = name.toUpperCase().includes('XSRF');
+
+    // Create cookie for .aryeo.com domain
+    cookies.push({
+      name,
+      value,
+      domain: '.aryeo.com',
+      path: '/',
+      expires: expiresUnix ?? -1, // -1 for session cookie if no expiry
+      httpOnly: isSessionCookie && !isXsrfCookie,
+      secure: true,
+      sameSite: 'Lax',
+    });
+
+    // Also create for app.aryeo.com for better compatibility
+    cookies.push({
+      name,
+      value,
+      domain: 'app.aryeo.com',
+      path: '/',
+      expires: expiresUnix ?? -1,
+      httpOnly: isSessionCookie && !isXsrfCookie,
+      secure: true,
+      sameSite: 'Lax',
+    });
+  }
+
+  return cookies;
+}
+
+/**
+ * Validates a CookieUploadBody.
+ */
+function isValidCookieUploadBody(obj: unknown): obj is CookieUploadBody {
+  if (!obj || typeof obj !== 'object') return false;
+  const body = obj as Record<string, unknown>;
+  if (typeof body.cookieHeader !== 'string' || !body.cookieHeader.trim()) return false;
+  if (body.xsrfHeader !== undefined && typeof body.xsrfHeader !== 'string') return false;
+  if (body.expiresAt !== undefined && typeof body.expiresAt !== 'string') return false;
+  return true;
+}
+
+/**
+ * Reads and parses the storage state file.
+ */
+function readStorageState(filePath: string): PlaywrightStorageState | null {
+  try {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const parsed = JSON.parse(content);
+    if (isValidStorageState(parsed)) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validates storage state for readiness check.
+ * Returns: 'ok' | 'missing' | 'invalid' | 'expired'
+ */
+function validateStorageStateForReadiness(filePath: string): 'ok' | 'missing' | 'invalid' | 'expired' {
+  if (!fs.existsSync(filePath)) {
+    return 'missing';
+  }
+
+  const state = readStorageState(filePath);
+  if (!state) {
+    return 'invalid';
+  }
+
+  if (state.cookies.length === 0) {
+    return 'invalid';
+  }
+
+  // Check if any essential cookies are expired
+  if (hasExpiredCookies(state.cookies)) {
+    return 'expired';
+  }
+
+  return 'ok';
+}
+
+/**
+ * Writes storage state atomically (temp file + rename) with chmod 600.
+ */
+async function writeStorageStateAtomically(filePath: string, content: string): Promise<void> {
+  const dir = path.dirname(filePath);
+
+  // Ensure directory exists
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  // Write to temp file
+  const tempPath = path.join(os.tmpdir(), `storage-state-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+
+  try {
+    fs.writeFileSync(tempPath, content, { mode: 0o600 });
+
+    // Verify it's valid JSON
+    JSON.parse(fs.readFileSync(tempPath, 'utf-8'));
+
+    // Atomic rename
+    fs.renameSync(tempPath, filePath);
+
+    // Ensure permissions are correct on final file
+    fs.chmodSync(filePath, 0o600);
+  } catch (err) {
+    // Cleanup temp file
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // Ignore cleanup errors
+    }
+    throw err;
   }
 }
 
@@ -185,10 +429,17 @@ async function createServer() {
 
   // Basic liveness check - always returns 200 if server is running
   fastify.get('/health', async (): Promise<HealthResponse> => {
+    // Check storage state for health response
+    const state = readStorageState(config.storageStatePath);
+    const storageStateStatus: 'ok' | 'missing' = state && state.cookies.length > 0 ? 'ok' : 'missing';
+    const cookieCount = state?.cookies.length ?? 0;
+
     return {
       status: 'ok',
       timestamp: new Date().toISOString(),
       version: VERSION,
+      storageState: storageStateStatus,
+      cookieCount,
     };
   });
 
@@ -198,16 +449,15 @@ async function createServer() {
     const redisConnected = await isRedisConnected();
     const redisStatus: 'ok' | 'error' = redisConnected ? 'ok' : 'error';
 
-    // Check storage state file exists
-    const storageStateExists = fs.existsSync(config.storageStatePath);
-    const storageStateStatus: 'ok' | 'missing' = storageStateExists ? 'ok' : 'missing';
+    // Check storage state file: exists, valid, not expired
+    const storageStateStatus = validateStorageStateForReadiness(config.storageStatePath);
 
     // Determine overall status
     let status: 'ok' | 'degraded' | 'unhealthy' = 'ok';
     if (redisStatus === 'error') {
       status = 'unhealthy';
       reply.status(503);
-    } else if (storageStateStatus === 'missing') {
+    } else if (storageStateStatus !== 'ok') {
       status = 'degraded';
       reply.status(200); // Still operational, just can't run automation
     }
@@ -222,6 +472,278 @@ async function createServer() {
       },
     };
   });
+
+  // ============================================================================
+  // POST /auth/storage-state - Upload Playwright storage state
+  // ============================================================================
+
+  fastify.post<{ Body: unknown }>(
+    '/auth/storage-state',
+    async (
+      request: FastifyRequest<{ Body: unknown }>,
+      reply: FastifyReply
+    ): Promise<StorageStateUploadResponse | { error: { code: string; message: string } }> => {
+      // Validate bearer token
+      if (!validateBearerToken(request, reply)) {
+        return reply as unknown as StorageStateUploadResponse;
+      }
+
+      const log = logger.child({ reqId: request.id, endpoint: '/auth/storage-state' });
+
+      // Validate the body is a valid storage state
+      if (!isValidStorageState(request.body)) {
+        log.warn('Invalid storage state format');
+        reply.status(400);
+        return {
+          error: {
+            code: 'INVALID_STORAGE_STATE',
+            message: 'Invalid storage state format. Expected { cookies: Array<{name, value, domain, path, ...}>, origins?: [...] }',
+          },
+        };
+      }
+
+      const storageState = request.body as PlaywrightStorageState;
+      const cookieCount = storageState.cookies.length;
+      const cookieNames = getUniqueCookieNames(storageState.cookies);
+
+      if (cookieCount === 0) {
+        log.warn('Storage state has no cookies');
+        reply.status(400);
+        return {
+          error: {
+            code: 'EMPTY_STORAGE_STATE',
+            message: 'Storage state must contain at least one cookie',
+          },
+        };
+      }
+
+      // Write atomically
+      try {
+        const jsonContent = JSON.stringify(storageState, null, 2);
+        await writeStorageStateAtomically(config.storageStatePath, jsonContent);
+
+        const updatedAt = new Date().toISOString();
+        log.info({ cookieCount, cookieNames }, 'Storage state updated successfully');
+
+        return {
+          ok: true,
+          cookieCount,
+          cookieNames,
+          updatedAt,
+        };
+      } catch (err) {
+        log.error({ error: err instanceof Error ? err.message : String(err) }, 'Failed to write storage state');
+        reply.status(500);
+        return {
+          error: {
+            code: 'WRITE_FAILED',
+            message: 'Failed to write storage state file',
+          },
+        };
+      }
+    }
+  );
+
+  // ============================================================================
+  // POST /auth/cookies - Upload cookies from aryeo-login output format
+  // ============================================================================
+
+  fastify.post<{ Body: unknown }>(
+    '/auth/cookies',
+    async (
+      request: FastifyRequest<{ Body: unknown }>,
+      reply: FastifyReply
+    ): Promise<StorageStateUploadResponse | { error: { code: string; message: string } }> => {
+      // Validate bearer token
+      if (!validateBearerToken(request, reply)) {
+        return reply as unknown as StorageStateUploadResponse;
+      }
+
+      const log = logger.child({ reqId: request.id, endpoint: '/auth/cookies' });
+
+      // Validate the body
+      if (!isValidCookieUploadBody(request.body)) {
+        log.warn('Invalid cookie upload body');
+        reply.status(400);
+        return {
+          error: {
+            code: 'INVALID_BODY',
+            message: 'Invalid body format. Expected { cookieHeader: string, xsrfHeader?: string, expiresAt?: string }',
+          },
+        };
+      }
+
+      const body = request.body as CookieUploadBody;
+
+      // Parse cookie header into Playwright cookies
+      const cookies = parseCookieHeader(body.cookieHeader, body.expiresAt);
+
+      if (cookies.length === 0) {
+        log.warn('No cookies parsed from cookieHeader');
+        reply.status(400);
+        return {
+          error: {
+            code: 'NO_COOKIES',
+            message: 'Could not parse any cookies from cookieHeader',
+          },
+        };
+      }
+
+      // Create Playwright storage state
+      const storageState: PlaywrightStorageState = {
+        cookies,
+        origins: [
+          {
+            origin: 'https://app.aryeo.com',
+            localStorage: [],
+          },
+        ],
+      };
+
+      const cookieCount = cookies.length;
+      const cookieNames = getUniqueCookieNames(cookies);
+
+      // Write atomically
+      try {
+        const jsonContent = JSON.stringify(storageState, null, 2);
+        await writeStorageStateAtomically(config.storageStatePath, jsonContent);
+
+        const updatedAt = new Date().toISOString();
+        log.info({ cookieCount, cookieNames }, 'Cookies converted and saved as storage state');
+
+        return {
+          ok: true,
+          cookieCount,
+          cookieNames,
+          updatedAt,
+        };
+      } catch (err) {
+        log.error({ error: err instanceof Error ? err.message : String(err) }, 'Failed to write storage state');
+        reply.status(500);
+        return {
+          error: {
+            code: 'WRITE_FAILED',
+            message: 'Failed to write storage state file',
+          },
+        };
+      }
+    }
+  );
+
+  // ============================================================================
+  // GET /auth/status - Get auth/storage state status
+  // ============================================================================
+
+  fastify.get(
+    '/auth/status',
+    async (request: FastifyRequest, reply: FastifyReply): Promise<AuthStatusResponse> => {
+      // Validate bearer token
+      if (!validateBearerToken(request, reply)) {
+        return reply as unknown as AuthStatusResponse;
+      }
+
+      const filePath = config.storageStatePath;
+
+      // Check if file exists
+      if (!fs.existsSync(filePath)) {
+        return {
+          storageState: 'missing',
+          cookieCount: 0,
+          cookieNames: [],
+          lastModified: null,
+          expiresAtEstimate: null,
+        };
+      }
+
+      try {
+        const stats = fs.statSync(filePath);
+        const state = readStorageState(filePath);
+
+        if (!state || state.cookies.length === 0) {
+          return {
+            storageState: 'missing',
+            cookieCount: 0,
+            cookieNames: [],
+            lastModified: stats.mtime.toISOString(),
+            expiresAtEstimate: null,
+          };
+        }
+
+        const cookieNames = getUniqueCookieNames(state.cookies);
+        const soonestExpiry = getSoonestExpiry(state.cookies);
+
+        return {
+          storageState: 'ok',
+          cookieCount: state.cookies.length,
+          cookieNames,
+          lastModified: stats.mtime.toISOString(),
+          expiresAtEstimate: soonestExpiry ? soonestExpiry.toISOString() : null,
+        };
+      } catch {
+        return {
+          storageState: 'missing',
+          cookieCount: 0,
+          cookieNames: [],
+          lastModified: null,
+          expiresAtEstimate: null,
+        };
+      }
+    }
+  );
+
+  // ============================================================================
+  // GET /auth/storage-state/status - Get storage state status
+  // ============================================================================
+
+  fastify.get(
+    '/auth/storage-state/status',
+    async (request: FastifyRequest, reply: FastifyReply): Promise<StorageStateStatusResponse> => {
+      // Validate bearer token
+      if (!validateBearerToken(request, reply)) {
+        return reply as unknown as StorageStateStatusResponse;
+      }
+
+      const filePath = config.storageStatePath;
+
+      // Check if file exists
+      if (!fs.existsSync(filePath)) {
+        return {
+          exists: false,
+        };
+      }
+
+      try {
+        const stats = fs.statSync(filePath);
+        const state = readStorageState(filePath);
+
+        if (!state) {
+          return {
+            exists: true,
+            sizeBytes: stats.size,
+            mtime: stats.mtime.toISOString(),
+            error: 'File exists but is not valid JSON or has invalid structure',
+          };
+        }
+
+        const soonestExpiry = getSoonestExpiry(state.cookies);
+        const domains = getUniqueDomains(state.cookies);
+
+        return {
+          exists: true,
+          sizeBytes: stats.size,
+          mtime: stats.mtime.toISOString(),
+          cookieCount: state.cookies.length,
+          soonestExpiry: soonestExpiry ? soonestExpiry.toISOString() : null,
+          domains,
+        };
+      } catch (err) {
+        return {
+          exists: true,
+          error: `Failed to read file: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    }
+  );
 
   // ============================================================================
   // POST /deliver - Queue a new delivery

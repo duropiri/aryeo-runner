@@ -4,12 +4,14 @@ This guide walks you through deploying the Aryeo Delivery Runner to production w
 
 ## Quick Reference
 
-| Endpoint | URL |
-|----------|-----|
-| Health Check | `GET https://runner.yourdomain.com/health` |
-| Readiness Check | `GET https://runner.yourdomain.com/ready` |
-| Deliver | `POST https://runner.yourdomain.com/deliver` |
-| Status | `GET https://runner.yourdomain.com/status/:run_id` |
+| Endpoint | URL | Auth Required |
+|----------|-----|---------------|
+| Health Check | `GET https://runner.yourdomain.com/health` | No |
+| Readiness Check | `GET https://runner.yourdomain.com/ready` | No |
+| Upload Storage State | `POST https://runner.yourdomain.com/auth/storage-state` | Yes |
+| Storage State Status | `GET https://runner.yourdomain.com/auth/storage-state/status` | Yes |
+| Deliver | `POST https://runner.yourdomain.com/deliver` | Yes |
+| Status | `GET https://runner.yourdomain.com/status/:run_id` | Yes |
 
 ---
 
@@ -43,12 +45,34 @@ nano .env
 
 ### Phase 3: Aryeo Session State
 
+**Option A: Interactive login (recommended for initial setup)**
 ```bash
 # On your LOCAL machine (with browser), generate the session:
 npm run login
 
 # Copy the session file to the server:
 scp ./data/auth/aryeo-storage-state.json user@server:/opt/aryeo-runner/data/auth/
+```
+
+**Option B: Non-interactive export + API push**
+```bash
+# On your LOCAL machine, export via HTTP login:
+ARYEO_EMAIL="your-email" ARYEO_PASSWORD="your-password" npm run export:storage-state
+
+# Push to runner via API:
+curl -X POST https://runner.yourdomain.com/auth/storage-state \
+  -H "Authorization: Bearer YOUR_RUNNER_AUTH_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @./data/auth/aryeo-storage-state.json
+```
+
+**Option C: Push directly with env vars**
+```bash
+ARYEO_EMAIL="your-email" \
+ARYEO_PASSWORD="your-password" \
+RUNNER_BASE_URL="https://runner.yourdomain.com" \
+RUNNER_AUTH_TOKEN="YOUR_TOKEN" \
+npm run export:storage-state -- --push
 ```
 
 ### Phase 4: Build and Start Services
@@ -485,6 +509,7 @@ docker compose -f docker-compose.production.yml restart
 
 When Aryeo session expires:
 
+**Method 1: SCP (traditional)**
 ```bash
 # On local machine
 npm run login
@@ -492,8 +517,56 @@ npm run login
 # Copy to server
 scp ./data/auth/aryeo-storage-state.json user@server:/opt/aryeo-runner/data/auth/
 
-# Restart worker
+# Restart worker (optional - worker reads fresh state per job)
 docker compose -f docker-compose.production.yml restart worker
+```
+
+**Method 2: API Push (no SSH required)**
+```bash
+# On local machine - export and push in one step
+ARYEO_EMAIL="your-email" \
+ARYEO_PASSWORD="your-password" \
+RUNNER_BASE_URL="https://runner.yourdomain.com" \
+RUNNER_AUTH_TOKEN="YOUR_TOKEN" \
+npm run export:storage-state -- --push
+```
+
+### Storage State API Examples
+
+**Check storage state status:**
+```bash
+curl -H "Authorization: Bearer YOUR_TOKEN" \
+  https://runner.yourdomain.com/auth/storage-state/status
+```
+
+Response:
+```json
+{
+  "exists": true,
+  "sizeBytes": 2048,
+  "mtime": "2024-01-15T10:30:00.000Z",
+  "cookieCount": 5,
+  "soonestExpiry": "2024-02-15T10:30:00.000Z",
+  "domains": [".aryeo.com", "app.aryeo.com"]
+}
+```
+
+**Upload storage state:**
+```bash
+curl -X POST https://runner.yourdomain.com/auth/storage-state \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @./data/auth/aryeo-storage-state.json
+```
+
+Response:
+```json
+{
+  "ok": true,
+  "cookieCount": 5,
+  "domains": [".aryeo.com", "app.aryeo.com"],
+  "updatedAt": "2024-01-15T10:35:00.000Z"
+}
 ```
 
 ### View Evidence Screenshots
@@ -515,7 +588,10 @@ curl -H "Authorization: Bearer TOKEN" \
 
 | Issue | Solution |
 |-------|----------|
-| `ARYEO_LOGIN_REQUIRED` | Re-run `npm run login` and copy session to server |
+| `ARYEO_LOGIN_REQUIRED` | Re-run `npm run login` or `npm run export:storage-state` and push to runner |
+| `/ready` shows `storageState: expired` | Session expired - refresh via API or SCP |
+| `/ready` shows `storageState: invalid` | Storage state file is corrupted - re-upload |
+| `/ready` shows `storageState: missing` | No storage state file - upload one first |
 | `HOST_NOT_ALLOWED` | Add hostname to `ALLOWED_HOSTS` in .env |
 | `Connection refused` | Check Docker containers are running |
 | `Rate limited` | Wait or increase `RATE_LIMIT_MAX_REQUESTS` |

@@ -10,6 +10,7 @@
     "dev": "tsx watch src/server.ts",
     "dev:worker": "tsx watch src/worker.ts",
     "login": "tsx scripts/login-aryeo.ts",
+    "export:storage-state": "tsx scripts/export-storage-state.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts"
   },
@@ -21,6 +22,7 @@
     "pino": "^9.3.2",
     "pino-pretty": "^11.2.2",
     "playwright": "^1.48.0",
+    "tough-cookie": "^6.0.0",
     "undici": "^6.19.8",
     "unzipper": "^0.12.3",
     "uuid": "^10.0.0",
@@ -28,6 +30,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.5.4",
+    "@types/tough-cookie": "^4.0.5",
     "@types/unzipper": "^0.10.10",
     "@types/uuid": "^10.0.0",
     "tsx": "^4.19.0",

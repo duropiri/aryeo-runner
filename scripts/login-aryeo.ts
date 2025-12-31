@@ -70,6 +70,29 @@ async function isLoggedIn(page: import('playwright').Page): Promise<boolean> {
   }
 }
 
+/**
+ * Safe page stabilization that doesn't hang on SPA background network activity.
+ * Avoids networkidle which can timeout on SPAs with persistent connections.
+ */
+async function waitForPageStable(page: import('playwright').Page): Promise<void> {
+  // Try to wait for dashboard-like URL (ignore failures)
+  try {
+    await page.waitForURL(/\/(admin|dashboard|listings|projects|orders)/, { timeout: 120000 });
+  } catch {
+    // URL pattern not matched, continue anyway
+  }
+
+  // Wait for DOM to be ready (ignore failures)
+  try {
+    await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
+  } catch {
+    // DOM not ready in time, continue anyway
+  }
+
+  // Brief pause to let any final renders complete
+  await page.waitForTimeout(1500);
+}
+
 async function main() {
   console.log('╔════════════════════════════════════════════════════════════╗');
   console.log('║         Aryeo Login - Session State Generator              ║');
@@ -104,7 +127,9 @@ async function main() {
   console.log(`URL: ${ARYEO_LOGIN_URL}`);
   console.log('');
 
-  await page.goto(ARYEO_LOGIN_URL, { waitUntil: 'networkidle' });
+  // Navigate and wait for DOM (avoid networkidle which can hang on SPAs)
+  await page.goto(ARYEO_LOGIN_URL, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(1500);
 
   console.log('╔════════════════════════════════════════════════════════════╗');
   console.log('║  Please log in to Aryeo in the browser window.             ║');
@@ -145,14 +170,22 @@ async function main() {
   console.log('');
   console.log('✓ Login detected! Saving session state...');
 
-  // Wait a moment for any final redirects/loads
-  await page.waitForLoadState('networkidle');
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+  // Wait for page to stabilize (safe sequence that won't hang on SPA)
+  await waitForPageStable(page);
 
-  // Save storage state
+  // Save storage state immediately after login is confirmed
   await context.storageState({ path: STORAGE_STATE_PATH });
 
+  // Verify file was written successfully
+  const fileStats = fs.statSync(STORAGE_STATE_PATH);
+  if (fileStats.size === 0) {
+    console.error('❌ Error: Session state file is empty!');
+    await browser.close();
+    process.exit(1);
+  }
+
   console.log(`✓ Session state saved to: ${STORAGE_STATE_PATH}`);
+  console.log(`✓ File size: ${fileStats.size} bytes`);
   console.log('');
 
   // Show session info

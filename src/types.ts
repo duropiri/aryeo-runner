@@ -204,6 +204,8 @@ export interface HealthResponse {
   status: 'ok';
   timestamp: string;
   version: string;
+  storageState: 'ok' | 'missing';
+  cookieCount: number;
 }
 
 // Configuration
@@ -237,8 +239,62 @@ export interface ReadinessResponse {
   version: string;
   checks: {
     redis: 'ok' | 'error';
-    storageState: 'ok' | 'missing';
+    storageState: 'ok' | 'missing' | 'invalid' | 'expired';
   };
+}
+
+// Storage state API types
+export interface StorageStateUploadResponse {
+  ok: boolean;
+  cookieCount: number;
+  cookieNames: string[];
+  updatedAt: string;
+}
+
+export interface StorageStateStatusResponse {
+  exists: boolean;
+  sizeBytes?: number;
+  mtime?: string;
+  cookieCount?: number;
+  soonestExpiry?: string | null;
+  domains?: string[];
+  error?: string;
+}
+
+// Auth status response (GET /auth/status)
+export interface AuthStatusResponse {
+  storageState: 'ok' | 'missing';
+  cookieCount: number;
+  cookieNames: string[];
+  lastModified: string | null;
+  expiresAtEstimate: string | null;
+}
+
+// Cookie upload body (POST /auth/cookies) - aryeo-login output format
+export interface CookieUploadBody {
+  cookieHeader: string;
+  xsrfHeader?: string;
+  expiresAt?: string;
+}
+
+// Playwright storage state format
+export interface PlaywrightCookie {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expires?: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
+}
+
+export interface PlaywrightStorageState {
+  cookies: PlaywrightCookie[];
+  origins?: Array<{
+    origin: string;
+    localStorage?: Array<{ name: string; value: string }>;
+  }>;
 }
 
 // URL validation result

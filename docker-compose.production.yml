@@ -44,9 +44,15 @@ services:
       - DATA_DIR=/app/data
       - TRUST_PROXY=true
     volumes:
-      # Single host bind mount for ALL persistent runner data:
-      # - /opt/aryeo-runner/data/auth/aryeo-storage-state.json
-      # - /opt/aryeo-runner/data/evidence/...
+      # Single host directory mount for ALL persistent runner data.
+      # The entrypoint script ensures subdirectories exist:
+      #   /app/data/auth/          - Storage state (aryeo-storage-state.json)
+      #   /app/data/evidence/      - Screenshot evidence per run
+      #   /app/data/temp/          - Temporary files
+      #
+      # On first deploy, create the host directory:
+      #   sudo mkdir -p /opt/aryeo-runner/data
+      #   sudo chown -R 1001:1001 /opt/aryeo-runner/data
       - /opt/aryeo-runner/data:/app/data
     depends_on:
       redis:
@@ -84,7 +90,7 @@ services:
       - PLAYWRIGHT_HEADLESS=true
       - DATA_DIR=/app/data
     volumes:
-      # Same single host bind mount
+      # Same directory mount as API - storage state is read fresh per job
       - /opt/aryeo-runner/data:/app/data
     depends_on:
       redis:
